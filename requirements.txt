@@ -1,0 +1,8 @@
+# Python 依赖清单
+# 用法：pip install -r requirements.txt
+feedparser
+requests
+fastapi
+uvicorn
+pydantic
+python-dotenv

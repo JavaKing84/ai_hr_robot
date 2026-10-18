@@ -1,0 +1,15 @@
+# Python虚拟环境
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 密钥、环境变量（绝对不要上传API Key）
+.env
+
+# VSCode配置缓存
+.vscode/
+
+# 日志文件
+*.log
