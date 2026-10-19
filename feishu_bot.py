@@ -5,8 +5,10 @@ import threading
 import time
 import schedule
 import os
+from dotenv import load_dotenv
 
 import news 
+load_dotenv()
 
 APP_ID = os.getenv("APP_ID")   
 APP_SECRET = os.getenv("APP_SECRET")
@@ -135,8 +137,8 @@ def auto_push_news():
 
 def run_scheduler():
     """后台定时线程"""
-    schedule.every().day.at("19:23").do(auto_push_news)
-    print("定时调度服务已启动，等待 19:23 触发...")
+    schedule.every().day.at("08:00").do(auto_push_news)
+    print("定时调度服务已启动，等待 08:00 触发...")
     
     while True:
         schedule.run_pending()
@@ -161,7 +163,7 @@ def main():
         log_level=lark.LogLevel.INFO
     )
     
-    print("启动成功。\n1. 去飞书发“新闻”可以实时回复。\n2. 程序会在每天 19:23 自动向群组推送。")
+    print("启动成功。\n1. 去飞书发“新闻”可以实时回复。\n2. 程序会在每天 08:00 自动向群组推送。")
     wsClient.start()
 
 if __name__ == "__main__":
