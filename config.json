@@ -1,8 +1,0 @@
-{
-    "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/791de10a-3a13-48c3-9362-a89ea577cd8b",
-    "secret": "P73RciM7yT6zqZHoUWS0dg",
-    "search_keyword": "AI人工智能",
-    "cron_time_list": ["16:30"],
-    "app_id": "cli_aa5e3b4d4bf85cec",
-    "app_secret": "nIcpZmKWHNUU4fbtIOYyVhgbkVG30GX8"
-}
