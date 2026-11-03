@@ -1,0 +1,445 @@
+"""主管反馈解析：飞书自由文本、飞书卡片回调、原邮件回复三条入口汇到同一个用例。
+
+两种回复路径（截图验收样例 + SKILL 要求）：
+- 飞书里直接回复「我已经筛选审核完毕，请通知张三、李四，于下周三下午 14:00 来公司面试」
+- 在收到的简历邮件上直接回复同样的内容
+
+处理原则：
+1. **只有主管给出明确结论（姓名 + 时间）才发通知邮件**；
+2. 缺姓名或缺时间 → 回一条飞书消息问清楚，不猜、不发错邮件；
+3. 候选人改期 → 先向主管确认新时间，确认后再补发确认邮件。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Sequence
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from config.settings import Settings
+from core.logging import get_logger, log_extra
+from core.timeparse import format_interview_time, now_local, parse_chinese_datetime, to_utc_naive
+from model.candidate import Candidate, CandidateStatus
+from model.event import Actor
+from model.message import Channel, Direction, Message
+from model.position import Position
+from model.supervisor import Supervisor
+from repository.candidate import CandidateRepository
+from repository.event import EventRepository
+from repository.message import MessageRepository
+from repository.position import PositionRepository
+from schema.config import CompanyInfo, MailboxConfig
+from schema.extraction import InterviewScheduleSchema, SourceQuote
+from schema.message import InboundMessage
+from service.extraction import ExtractionService
+from service.notification import NotificationService
+
+logger = get_logger(__name__)
+
+_SCHEDULABLE_STATUSES = (
+    CandidateStatus.DISPATCHED,
+    CandidateStatus.SUPERVISOR_FEEDBACK,
+    CandidateStatus.RESCHEDULE_PENDING,
+    CandidateStatus.INTERVIEW_NOTIFIED,
+)
+_APPROVAL_WORDS = ("同意", "可以", "没问题", "行", "好的", "都行", "就这么定", "按这个时间")
+
+
+@dataclass
+class FeedbackOutcome:
+    handled: bool = False
+    action: str = ""
+    detail: dict[str, Any] = field(default_factory=dict)
+    reply_text: str = ""
+
+
+class FeedbackService:
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        settings: Settings,
+        extraction: ExtractionService,
+        notification: NotificationService,
+        company: CompanyInfo | None = None,
+        mailbox_config: MailboxConfig | None = None,
+    ) -> None:
+        self.session = session
+        self.settings = settings
+        self.extraction = extraction
+        self.notification = notification
+        self.company = company or CompanyInfo()
+        self.mailbox_config = mailbox_config or MailboxConfig()
+        self.candidates = CandidateRepository(session)
+        self.positions = PositionRepository(session)
+        self.events = EventRepository(session)
+        self.messages = MessageRepository(session)
+
+    # ------------------------------------------------------------------ 入口
+    async def handle(self, inbound: InboundMessage) -> FeedbackOutcome:
+        supervisor = await self._resolve_supervisor(inbound)
+        if supervisor is None:
+            await self.events.record(
+                "feedback.supervisor_unknown",
+                actor=Actor.SYSTEM,
+                object_type="message",
+                object_id=None,
+                detail={"sender": inbound.sender_id, "channel": inbound.channel, "text": inbound.text[:200]},
+                note="收到无法识别为主管的消息，已忽略",
+            )
+            await self.session.commit()
+            return FeedbackOutcome(handled=False, action="supervisor_unknown", reply_text="发送者不是已登记的主管")
+
+        positions = await self._positions_of(supervisor)
+        if not positions:
+            return FeedbackOutcome(handled=False, action="no_position", reply_text="该主管名下没有在招职位")
+
+        message_row = await self._record_inbound(inbound, supervisor)
+        active = await self.candidates.list_active_for_positions(
+            [p.id for p in positions], statuses=list(_SCHEDULABLE_STATUSES)
+        )
+        pending = [c for c in active if c.status == CandidateStatus.RESCHEDULE_PENDING]
+
+        # 场景 A：主管在回复“候选人改期”的请示
+        if pending and self._looks_like_reschedule_decision(inbound.text, pending):
+            outcome = await self._handle_reschedule_decision(
+                inbound, supervisor, positions, pending, message_row
+            )
+            await self.session.commit()
+            return outcome
+
+        # 场景 B：主管给出面试名单 + 时间
+        outcome = await self._handle_schedule(inbound, supervisor, positions, active, message_row)
+        await self.session.commit()
+        return outcome
+
+    # ------------------------------------------------------------ 场景 B：安排
+    async def _handle_schedule(
+        self,
+        inbound: InboundMessage,
+        supervisor: Supervisor,
+        positions: Sequence[Position],
+        active: Sequence[Candidate],
+        message_row: Message,
+    ) -> FeedbackOutcome:
+        roster = [c for c in active if c.status in (CandidateStatus.DISPATCHED, CandidateStatus.SUPERVISOR_FEEDBACK)]
+        roster_names = [c.name for c in roster if c.name]
+        primary_position = self._primary_position(positions, roster)
+
+        schedule = self._schedule_from_card(inbound)
+        if schedule is None:
+            schedule = await self.extraction.extract_interview_schedule(
+                inbound,
+                roster=roster_names,
+                position_title=primary_position.title if primary_position else "",
+                location_default=self.mailbox_config.interview_location,
+            )
+
+        message_row.parsed = schedule.model_dump(mode="json")
+        message_row.confidence = schedule.confidence
+        await self.session.flush()
+
+        names = [name for name in schedule.candidate_names if name in set(roster_names)]
+        if not names:
+            text = self._format_hint(supervisor, roster)
+            await self.notification.notify_supervisor(
+                supervisor.feishu_open_id,
+                text,
+                position_id=primary_position.id if primary_position else None,
+                kind="feedback_unparsed",
+            )
+            await self.events.record(
+                "feedback.unparsed",
+                actor=Actor.SUPERVISOR,
+                object_type="message",
+                object_id=message_row.id,
+                detail={"text": inbound.text[:500], "roster": roster_names},
+                note="未识别出面试名单，已回消息说明格式",
+            )
+            return FeedbackOutcome(handled=False, action="unparsed", reply_text=text)
+
+        if schedule.interview_time is None:
+            text = (
+                f"{supervisor.title or supervisor.name}，收到名单：{'、'.join(names)}。\n"
+                "还差一个面试时间，请回复具体时间，例如「下周三下午 14:00」，我马上发面试通知邮件。"
+            )
+            await self.notification.notify_supervisor(
+                supervisor.feishu_open_id, text, kind="feedback_missing_time"
+            )
+            await self.events.record(
+                "feedback.missing_time",
+                actor=Actor.SUPERVISOR,
+                object_type="message",
+                object_id=message_row.id,
+                detail={"names": names},
+                note="已向主管追要面试时间（不猜时间，不发错邮件）",
+            )
+            return FeedbackOutcome(handled=False, action="missing_time", reply_text=text)
+
+        interview_time = to_utc_naive(schedule.interview_time)
+        location = (
+            schedule.location
+            or self.mailbox_config.interview_location
+            or "地点待定"
+        )
+
+        selected = [c for c in roster if c.name in set(names)]
+        grouped: dict[int, list[Candidate]] = {}
+        for candidate in selected:
+            grouped.setdefault(candidate.position_id or 0, []).append(candidate)
+
+        sent_total = 0
+        for position_id, group in grouped.items():
+            position = await self.session.get(Position, position_id)
+            if position is None:
+                continue
+            for candidate in group:
+                from_state = candidate.status
+                candidate.status = CandidateStatus.SUPERVISOR_FEEDBACK
+                await self.session.flush()
+                await self.events.record(
+                    "feedback.received",
+                    actor=Actor.SUPERVISOR,
+                    object_type="candidate",
+                    object_id=candidate.id,
+                    from_state=from_state,
+                    to_state=CandidateStatus.SUPERVISOR_FEEDBACK,
+                    detail={
+                        "interview_time": interview_time.isoformat(),
+                        "location": location,
+                        "source": inbound.channel,
+                        "message_id": message_row.id,
+                    },
+                    note="主管确认面试名单与时间",
+                )
+
+            results = await self.notification.send_interview_notices(
+                group, position, interview_time=interview_time, location=location
+            )
+            sent_total += len([r for r in results if r.ok])
+
+            await self.notification.send_receipt_to_supervisor(
+                supervisor.feishu_open_id,
+                supervisor_title=supervisor.title or supervisor.name,
+                position=position,
+                candidates=group,
+                interview_time=interview_time,
+                location=location,
+            )
+
+        await self.events.record(
+            "feedback.schedule_applied",
+            actor=Actor.ROBOT,
+            object_type="message",
+            object_id=message_row.id,
+            detail={
+                "names": names,
+                "interview_time": interview_time.isoformat(),
+                "location": location,
+                "notices_sent": sent_total,
+                "source": inbound.channel,
+            },
+            note=f"已按主管安排向 {sent_total} 位候选人发送面试通知邮件",
+        )
+        return FeedbackOutcome(
+            handled=True,
+            action="interview_scheduled",
+            detail={
+                "candidate_names": names,
+                "interview_time": interview_time.isoformat(),
+                "location": location,
+                "notices_sent": sent_total,
+            },
+        )
+
+    # ------------------------------------------------------------ 场景 A：改期
+    def _looks_like_reschedule_decision(self, text: str, pending: Sequence[Candidate]) -> bool:
+        names = [c.name for c in pending if c.name]
+        if any(name in text for name in names):
+            return True
+        if parse_chinese_datetime(text, now=now_local(self.settings.timezone), tz=self.settings.timezone):
+            return True
+        return any(word in text for word in _APPROVAL_WORDS)
+
+    async def _handle_reschedule_decision(
+        self,
+        inbound: InboundMessage,
+        supervisor: Supervisor,
+        positions: Sequence[Position],
+        pending: Sequence[Candidate],
+        message_row: Message,
+    ) -> FeedbackOutcome:
+        named = [c for c in pending if c.name and c.name in inbound.text]
+        targets = named or list(pending)
+        proposed = parse_chinese_datetime(
+            inbound.text, now=now_local(self.settings.timezone), tz=self.settings.timezone
+        )
+        approved = any(word in inbound.text for word in _APPROVAL_WORDS)
+
+        if proposed is None and not approved:
+            text = (
+                f"{supervisor.title or supervisor.name}，候选人 "
+                f"{'、'.join(c.name for c in targets)} 申请改期。\n"
+                "请直接回复新的时间（例如「改到周四下午 3 点」）或回复「同意」按候选人提议的时间安排。"
+            )
+            await self.notification.notify_supervisor(
+                supervisor.feishu_open_id, text, kind="reschedule_need_decision"
+            )
+            return FeedbackOutcome(handled=False, action="reschedule_need_decision", reply_text=text)
+
+        confirmed = 0
+        applied: list[datetime] = []
+        for candidate in targets:
+            new_time = to_utc_naive(proposed) if proposed else await self._proposed_time(candidate)
+            if new_time is None:
+                continue
+            applied.append(new_time)
+            position = await self.session.get(Position, candidate.position_id)
+            if position is None:
+                continue
+            old_time = candidate.interview_time
+            result = await self.notification.send_reschedule_confirmation(
+                candidate,
+                position,
+                new_time=new_time,
+                old_time=old_time,
+                location=candidate.interview_location or self.mailbox_config.interview_location,
+            )
+            if result.ok:
+                confirmed += 1
+            await self.events.record(
+                "candidate.reschedule_confirmed",
+                actor=Actor.ROBOT,
+                object_type="candidate",
+                object_id=candidate.id,
+                from_state=CandidateStatus.RESCHEDULE_PENDING,
+                to_state=CandidateStatus.INTERVIEW_NOTIFIED,
+                detail={
+                    "new_time": new_time.isoformat(),
+                    "old_time": old_time.isoformat() if old_time else None,
+                    "approved_by_supervisor": True,
+                },
+                note="主管确认改期，已补发确认邮件",
+            )
+
+        await self.notification.notify_supervisor(
+            supervisor.feishu_open_id,
+            (
+                f"{supervisor.title or supervisor.name}，已按您的时间调整并通知候选人："
+                f"{'、'.join(c.name for c in targets)}"
+                f"（{format_interview_time(applied[0] if applied else None, self.settings.timezone)}）。"
+            ),
+            kind="reschedule_confirmed_receipt",
+        )
+        return FeedbackOutcome(
+            handled=True,
+            action="reschedule_confirmed",
+            detail={"candidates": [c.name for c in targets], "confirmed": confirmed},
+        )
+
+    # ------------------------------------------------------------------ 工具
+    async def _proposed_time(self, candidate: Candidate) -> datetime | None:
+        events = await self.events.list_for_object("candidate", candidate.id)
+        for event in reversed(events):
+            if event.action == "candidate.reply.reschedule":
+                raw = (event.detail or {}).get("proposed_time")
+                if raw:
+                    try:
+                        return datetime.fromisoformat(raw)
+                    except ValueError:
+                        continue
+        return None
+
+    def _schedule_from_card(self, inbound: InboundMessage) -> InterviewScheduleSchema | None:
+        if inbound.kind != "card_action" or not inbound.action:
+            return None
+        names = inbound.action.get("candidate_names") or inbound.action.get("names") or []
+        if isinstance(names, str):
+            names = [chunk for chunk in names.replace("，", ",").split(",") if chunk]
+        raw_time = inbound.action.get("interview_time") or inbound.action.get("time")
+        parsed_time = (
+            parse_chinese_datetime(str(raw_time), now=now_local(self.settings.timezone), tz=self.settings.timezone)
+            if raw_time
+            else None
+        )
+        if not names and not parsed_time:
+            return None
+        return InterviewScheduleSchema(
+            candidate_names=[str(name) for name in names],
+            interview_time=parsed_time,
+            location=str(inbound.action.get("location") or ""),
+            confidence=0.95,
+            source_quotes=[SourceQuote(field="card_action", quote=str(inbound.action)[:200])],
+            method="rule",
+        )
+
+    async def _resolve_supervisor(self, inbound: InboundMessage) -> Supervisor | None:
+        """飞书按 open_id 认人，邮件按发件地址认人——两条路径都落到同一张 supervisors 表。"""
+        if inbound.channel == Channel.FEISHU:
+            return await self._supervisor_by_open_id(inbound.sender_id)
+        return await self._supervisor_by_email(inbound.sender_id)
+
+    async def _supervisor_by_open_id(self, open_id: str) -> Supervisor | None:
+        result = await self.session.execute(
+            select(Supervisor).where(Supervisor.feishu_open_id == open_id)
+        )
+        return result.scalars().first()
+
+    async def _supervisor_by_email(self, email: str) -> Supervisor | None:
+        result = await self.session.execute(
+            select(Supervisor).where(Supervisor.email.ilike((email or "").strip().lower()))
+        )
+        return result.scalars().first()
+
+    async def _positions_of(self, supervisor: Supervisor) -> list[Position]:
+        result = await self.session.execute(
+            select(Position).where(
+                Position.supervisor_open_id == supervisor.feishu_open_id, Position.active.is_(True)
+            )
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    def _primary_position(positions: Sequence[Position], roster: Sequence[Candidate]) -> Position | None:
+        if len(positions) == 1:
+            return positions[0]
+        if roster:
+            position_id = roster[0].position_id
+            for position in positions:
+                if position.id == position_id:
+                    return position
+        return positions[0] if positions else None
+
+    def _format_hint(self, supervisor: Supervisor, roster: Sequence[Candidate]) -> str:
+        names = "、".join(c.name for c in roster[:8]) or "（本轮没有待反馈的候选人）"
+        return (
+            f"{supervisor.title or supervisor.name}，我还没看懂您的安排，请按下面任一种格式回复我：\n"
+            f"「请通知张三、李四，下周三下午 14:00 来公司面试」\n\n"
+            f"本轮待您反馈的候选人：{names}\n"
+            "如果全部通过，直接回复「全部通过，下周三下午 14:00 面试」也可以。"
+        )
+
+    async def _record_inbound(self, inbound: InboundMessage, supervisor: Supervisor) -> Message:
+        message = await self.messages.add(
+            Message(
+                channel=Channel.FEISHU if inbound.channel == "feishu" else Channel.EMAIL,
+                direction=Direction.INBOUND,
+                sender=inbound.sender_id,
+                recipient="ai-hr-robot" if inbound.channel == "feishu" else self.settings.hr_mailbox,
+                subject=inbound.subject,
+                body=inbound.text,
+                external_id=inbound.message_id,
+                thread_key=inbound.thread_id,
+                supervisor_id=supervisor.id,
+                status="received",
+                received_at=inbound.received_at,
+                raw={"kind": inbound.kind, "action": inbound.action},
+            )
+        )
+        return message
+
+
+__all__ = ["FeedbackOutcome", "FeedbackService"]

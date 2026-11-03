@@ -1,0 +1,212 @@
+# =============================================================================
+# ai-hr 业务配置（HR 可直接编辑，下一轮定时任务即生效）
+#
+# 结构：company / schedule / mailbox / departments[] -> supervisor + positions[]
+#   - supervisor.feishu_open_id：机器人向谁发简历包与对话（飞书）
+#   - supervisor.email：简历包副本抄送地址，主管可直接在“原邮件”上回复面试名单
+#   - positions[].screening：硬性条件（不过即淘汰）+ 加权项（0-100 归一化打分）
+#   - threshold：加权得分及格线，低于此线视为未通过
+#   - keywords：简历未写明应聘岗位时，用关键词把简历归位到该职位
+# =============================================================================
+company:
+  name: 星野科技（测试公司）
+  hr_name: 李静
+  hr_title: HR 招聘专员
+  hr_contact: 李静（HR 招聘专员）｜电话 010-8888 6666｜hr@xingye-test.com
+
+schedule:
+  cron: "0 9 * * *"        # 每天 09:00 触发一轮完整闭环
+  timezone: Asia/Shanghai
+  lookback_hours: 24
+  max_resumes_per_cycle: 500
+
+mailbox:
+  address: hr@xingye-test.com
+  sender_name: 星野科技 HR
+  interview_location: 北京市海淀区中关村南大街 5 号 星野大厦 12 层 1203 会议室
+  meeting_link: ""
+  reply_token_domain: xingye-test.com
+
+departments:
+  - name: 技术部
+    supervisor:
+      name: 张伟
+      title: 张总
+      feishu_open_id: ou_mock_zhangwei
+      email: zhangwei@xingye-test.com
+    positions:
+      - code: backend_senior
+        title: 高级后端工程师
+        headcount: 2
+        description: >-
+          负责招聘系统与内部平台的后端服务设计与开发，要求熟悉 Python/FastAPI 或 Java/Spring，
+          具备 PostgreSQL/Redis 使用经验，能承担高并发与分布式系统的性能优化。
+        keywords: [后端, 服务端, Python, Java, FastAPI, 微服务, 分布式]
+        screening:
+          threshold: 60
+          rule_version: v1
+          hard_conditions:
+            - field: education_level
+              operator: gte
+              value: 本科
+              label: 学历本科及以上
+            - field: years_experience
+              operator: gte
+              value: 3
+              label: 3 年以上后端开发经验
+            - field: major
+              operator: contains_any
+              value: [计算机, 软件, 电子信息, 人工智能, 数学, 自动化]
+              label: 专业对口（计算机/软件/电子信息等）
+          weighted:
+            - field: skills
+              operator: contains_any
+              weight: 40
+              value: [Python, FastAPI, Java, Spring, PostgreSQL, MySQL, Redis, Docker, Kubernetes, 微服务]
+              label: 技术栈匹配度
+            - field: project_highlights
+              operator: contains_any
+              weight: 25
+              value: [高并发, 分布式, 性能优化, 微服务, 重构, 稳定性]
+              label: 项目复杂度
+            - field: years_experience
+              operator: gte
+              weight: 20
+              value: 5
+              label: 经验年限
+            - field: school
+              operator: exists
+              value: true
+              weight: 15
+              label: 院校信息完整
+
+      - code: algorithm_engineer
+        title: 算法工程师
+        headcount: 1
+        description: >-
+          负责简历解析、人岗匹配与信息抽取算法的研发，要求掌握 PyTorch/TensorFlow，
+          有 NLP 或大模型落地经验，硕士及以上学历。
+        keywords: [算法, 机器学习, 深度学习, NLP, 大模型, PyTorch]
+        screening:
+          threshold: 60
+          rule_version: v1
+          hard_conditions:
+            - field: education_level
+              operator: gte
+              value: 硕士
+              label: 硕士及以上学历
+            - field: school
+              operator: contains_any
+              value: [清华大学, 北京大学, 浙江大学, 上海交通大学, 北京邮电大学, 华中科技大学, 电子科技大学, 西安电子科技大学, 中国科学院大学]
+              label: 毕业院校须为重点院校
+            - field: years_experience
+              operator: gte
+              value: 2
+              label: 2 年以上算法相关经验
+          weighted:
+            - field: skills
+              operator: contains_any
+              weight: 50
+              value: [PyTorch, TensorFlow, 深度学习, NLP, 自然语言处理, CV, 大模型, Transformer, LLM]
+              label: 算法栈匹配度
+            - field: project_highlights
+              operator: contains_any
+              weight: 30
+              value: [论文, 竞赛, Kaggle, 顶会, 上线, 落地, 召回]
+              label: 项目与研究成果
+            - field: major
+              operator: contains_any
+              weight: 20
+              value: [人工智能, 计算机, 数学, 统计, 自动化, 模式识别]
+              label: 专业相关性
+
+  - name: 产品部
+    supervisor:
+      name: 李娜
+      title: 李总
+      feishu_open_id: ou_mock_lina
+      email: lina@xingye-test.com
+    positions:
+      - code: product_manager
+        title: 产品经理
+        headcount: 1
+        description: >-
+          负责企业服务类产品的需求分析与版本规划，要求具备 B 端产品经验、
+          能独立完成 PRD 与数据分析闭环。
+        keywords: [产品经理, 需求分析, PRD, 产品设计]
+        screening:
+          threshold: 55
+          rule_version: v1
+          hard_conditions:
+            - field: education_level
+              operator: gte
+              value: 本科
+              label: 学历本科及以上
+            - field: years_experience
+              operator: gte
+              value: 2
+              label: 2 年以上产品经验
+          weighted:
+            - field: skills
+              operator: contains_any
+              weight: 45
+              value: [需求分析, 竞品分析, PRD, 数据分析, 用户研究, Axure, SQL, 版本规划]
+              label: 产品技能匹配度
+            - field: project_highlights
+              operator: contains_any
+              weight: 25
+              value: [0 到 1, 0到1, B 端, B端, G 端, G端, 增长, 商业化, 中台]
+              label: 项目经历相关度
+            - field: major
+              operator: contains_any
+              weight: 15
+              value: [市场, 管理, 经济, 计算机, 新闻, 心理, 信息]
+              label: 专业相关性
+            - field: years_experience
+              operator: gte
+              weight: 15
+              value: 4
+              label: 经验年限
+
+  - name: 市场部
+    supervisor:
+      name: 王强
+      title: 王总
+      feishu_open_id: ou_mock_wangqiang
+      email: wangqiang@xingye-test.com
+    positions:
+      - code: marketing_specialist
+        title: 市场运营专员
+        headcount: 1
+        description: >-
+          负责内容运营、活动策划与投放效果优化，要求有社群或新媒体运营经验，
+          能用数据评估投放 ROI。
+        keywords: [市场, 运营, 内容运营, 活动策划, 新媒体, 投放]
+        screening:
+          threshold: 45
+          rule_version: v1
+          hard_conditions:
+            - field: education_level
+              operator: gte
+              value: 大专
+              label: 大专及以上学历
+            - field: years_experience
+              operator: gte
+              value: 1
+              label: 1 年以上市场/运营经验
+          weighted:
+            - field: skills
+              operator: contains_any
+              weight: 50
+              value: [内容运营, 活动策划, 社群, 投放, SEO, 短视频, 数据分析, 新媒体, 增长]
+              label: 运营技能匹配度
+            - field: project_highlights
+              operator: contains_any
+              weight: 30
+              value: [涨粉, 转化, GMV, 曝光, ROI, 复购, 拉新]
+              label: 成果量化程度
+            - field: major
+              operator: contains_any
+              weight: 20
+              value: [市场, 新闻, 传播, 中文, 广告, 管理]
+              label: 专业相关性
