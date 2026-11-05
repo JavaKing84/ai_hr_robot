@@ -120,7 +120,7 @@ curl http://localhost:8000/health
 
 | 变量 | 说明 | 默认 |
 |---|---|---|
-| `DATABASE_URL` | `sqlite+aiosqlite:///./var/hr_robot.db` 或 `postgresql+asyncpg://...` | SQLite |
+| `DATABASE_URL` | `postgresql+asyncpg://hr:hr@localhost:5432/hr_robot`（本地/生产）；测试用 SQLite（由 `tests/conftest.py` 注入） | PostgreSQL |
 | `FEISHU_MODE` | `mock` / `live` | `mock` |
 | `MAIL_MODE` | `mock` / `live` / `off` | `mock` |
 | `LLM_MODE` | `auto`（有 key 才调）/ `live` / `off` | `auto` |

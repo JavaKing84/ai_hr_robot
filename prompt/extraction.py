@@ -65,6 +65,23 @@ INTERVIEW_SYSTEM = (
     "「要面试哪些人」和「面试在什么时间」。只输出 JSON 对象，不要解释。"
 )
 
+# Few-shot 样例（§4-A.2 量化调优，仅供 LLM 路径理解格式）：
+# 只做示例，不改动既有抽取要求与 JSON Schema；样例姓名全部来自名单、时间全部可解析，
+# 专门用于强化「姓名接地 + 中文时间」的正确范式。真实接地由 service 层强制，不依赖本样例。
+INTERVIEW_FEW_SHOT = """\
+示例（仅用于理解格式；姓名必须来自上面的名单，时间必须可解析，禁止把「12 份」「3 人」当姓名）：
+
+输入：下周三下午两点张明和李四来面试
+输出：{"candidate_names": ["张明", "李四"], "interview_time": "2026-11-11T14:00:00+08:00", "location": "", "position_title": "", "notes": "", "confidence": 0.95, "source_quotes": [{"field": "candidate_names", "quote": "张明和李四"}, {"field": "interview_time", "quote": "下周三下午两点"}]}
+
+输入：这 12 份我只留了 3 份，请通知刘洋、陈静、周涛 3 人于下周二上午 10 点到公司 9 楼会议室面试
+输出：{"candidate_names": ["刘洋", "陈静", "周涛"], "interview_time": "2026-11-10T10:00:00+08:00", "location": "9 楼会议室", "position_title": "", "notes": "", "confidence": 0.9, "source_quotes": [{"field": "candidate_names", "quote": "刘洋、陈静、周涛"}, {"field": "interview_time", "quote": "下周二上午 10 点"}]}
+
+输入：请通知王小明，下周来面试（具体时间我后面再定）
+输出：{"candidate_names": ["王小明"], "interview_time": null, "location": "", "position_title": "", "notes": "时间未定", "confidence": 0.6, "source_quotes": [{"field": "candidate_names", "quote": "王小明"}]}
+（含糊无具体时间时 interview_time 必须填 null，不要编造时间）
+"""
+
 
 def build_interview_prompt(
     message_text: str,
@@ -101,6 +118,8 @@ def build_interview_prompt(
 
 JSON Schema 参考：
 {_schema_hint(InterviewScheduleSchema)}
+
+{INTERVIEW_FEW_SHOT}
 """
 
 
@@ -110,6 +129,21 @@ REPLY_SYSTEM = (
     "你是 HR 招聘机器人的邮件理解引擎。判断候选人对面试邀约的意向，"
     "并抽取其期望的新时间。只输出 JSON 对象，不要解释。"
 )
+
+# Few-shot 样例（§4-A.2 量化调优）：覆盖「改期 / 放弃 / 确认」三类意图，
+# 用于强化意图识别与「改到 X」之后的时间抽取；不改动既有抽取要求与 Schema。
+REPLY_FEW_SHOT = """\
+示例（仅用于理解格式）：
+
+输入：您好，我下周二临时有会，能否改到周四下午 3 点？
+输出：{"intent": "reschedule", "proposed_time": "2026-11-05T15:00:00+08:00", "reason": "下周二有会", "confidence": 0.9, "source_quotes": [{"field": "intent", "quote": "改到周四下午 3 点"}, {"field": "proposed_time", "quote": "改到周四下午 3 点"}]}
+
+输入：不好意思，我已经找到工作了，这次就不参加了。
+输出：{"intent": "decline", "proposed_time": null, "reason": "已找到工作", "confidence": 0.95, "source_quotes": [{"field": "intent", "quote": "找到工作"}]}
+
+输入：收到，我会准时参加面试，谢谢！
+输出：{"intent": "confirm", "proposed_time": null, "reason": "", "confidence": 0.95, "source_quotes": []}
+"""
 
 
 def build_candidate_reply_prompt(
@@ -139,6 +173,8 @@ def build_candidate_reply_prompt(
 
 JSON Schema 参考：
 {_schema_hint(CandidateReplySchema)}
+
+{REPLY_FEW_SHOT}
 """
 
 

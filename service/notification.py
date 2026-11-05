@@ -99,7 +99,7 @@ class NotificationService:
             try:
                 result = await self._dispatch_position(cycle_id, position, group, received_count)
             except Exception as exc:  # noqa: BLE001 - 单职位失败不影响其他部门
-                logger.exception("dispatch.failed", extra=log_extra(position=position.code))
+                logger.exception("dispatch.failed", extra=log_extra(cycle_id=cycle_id, position=position.code))
                 result = PackageDispatchResult(
                     position_code=position.code,
                     position_title=position.title,
@@ -254,7 +254,10 @@ class NotificationService:
                 if resume_path and resume_path.exists():
                     arcname = f"{index:02d}-{candidate.name or '候选人'}-{resume_path.name}"
                     archive.write(resume_path, arcname=arcname)
-        logger.info("package.built", extra=log_extra(position=position.code, path=str(package_path)))
+        logger.info(
+            "package.built",
+            extra=log_extra(cycle_id=cycle_id, position=position.code, path=str(package_path)),
+        )
         return package_path, package_name
 
     async def _send_supervisor_email(
@@ -334,6 +337,7 @@ class NotificationService:
         interview_time: datetime,
         location: str | None = None,
         notes: str = "",
+        message_id: str | None = None,
     ) -> NoticeResult:
         if not candidate.email:
             return NoticeResult(ok=False, detail="候选人缺邮箱，无法发送面试通知")
@@ -355,8 +359,18 @@ class NotificationService:
 
         thread = await self.threads.find_for_candidate(candidate.id, kind=ThreadKind.INTERVIEW_NOTICE)
         token = thread.token if thread else uuid.uuid4().hex[:16]
-        message_id = self.mailbox.new_message_id()
+        # 幂等键（§4-A.1a）：默认仍由 mailbox.new_message_id() 生成；补发时复用原 Message-ID
+        message_id = message_id or self.mailbox.new_message_id()
         reply_to = self.mailbox.reply_address(token)
+
+        # 幂等防重：同一 Message-ID 已成功发出（sent/mocked）→ 跳过，绝不发第二封
+        delivered = await self.messages.find_delivered(message_id)
+        if delivered is not None:
+            logger.info(
+                "interview.notice.duplicate_skipped",
+                extra=log_extra(candidate_id=candidate.id, message_id=message_id),
+            )
+            return NoticeResult(ok=True, message_id=message_id, detail="已发送过，幂等跳过")
 
         result = await self.mailbox.send(
             to=candidate.email,
@@ -378,7 +392,7 @@ class NotificationService:
                 position_id=position.id,
                 meta={"interview_time": interview_time.isoformat()},
             )
-        else:
+        elif message_id not in (thread.message_ids or []):
             await self.threads.append_message_id(thread, message_id)
 
         from_state = candidate.status
@@ -414,6 +428,11 @@ class NotificationService:
                 "error": result.error,
             },
         )
+        if not result.ok:
+            logger.warning(
+                "interview.notice.send_failed",
+                extra=log_extra(candidate_id=candidate.id, message_id=message_id, error=result.error),
+            )
         await self.session.commit()
         return NoticeResult(ok=result.ok, message_id=message_id, detail=result.error)
 
@@ -434,6 +453,101 @@ class NotificationService:
                 )
             )
         return results
+
+    # ------------------------------------------------- 幂等补发（§4-A.1(b)）
+    async def retry_failed_interview_notices(self) -> list[NoticeResult]:
+        """补发历史上发送失败的面试通知邮件。
+
+        范式：失败时不立即重试（候选人绝不连收多封），由下一轮 / 人工触发本入口；
+        每条失败记录按**原 Message-ID** 走 send_interview_notice 的幂等检查后补发，
+        已成功发出的自动跳过，因此补发不产生重复邮件。
+        """
+        failed = await self.messages.list_failed_outbound(channel=Channel.EMAIL)
+        results: list[NoticeResult] = []
+        for record in failed:
+            # 主管简历包邮件（candidate_id 为空）的失败由 dispatch_cycle 处理，不在本入口补发
+            if not record.candidate_id:
+                continue
+            candidate = await self.candidates.get(record.candidate_id)
+            if candidate is None or not candidate.email or not candidate.interview_time or not candidate.position_id:
+                logger.warning(
+                    "retry.notice.skipped",
+                    extra=log_extra(message_id=record.external_id, reason="候选人/时间/职位信息缺失"),
+                )
+                continue
+            # 改期确认邮件依赖主管已确认的新时间（I-06），自动补发有越权风险，留给人工处理
+            if "调整" in record.subject:
+                logger.warning(
+                    "retry.reschedule_manual",
+                    extra=log_extra(message_id=record.external_id, candidate_id=candidate.id),
+                )
+                continue
+            position = await self.session.get(Position, candidate.position_id)
+            if position is None:
+                continue
+            result = await self.send_interview_notice(
+                candidate, position, interview_time=candidate.interview_time, message_id=record.external_id
+            )
+            logger.info(
+                "retry.notice.done",
+                extra=log_extra(
+                    candidate_id=candidate.id,
+                    message_id=record.external_id,
+                    ok=result.ok,
+                    detail=result.detail,
+                ),
+            )
+            results.append(result)
+        return results
+
+    async def retry_failed_feishu_messages(self) -> int:
+        """补发失败的出站飞书消息，返回实际补发条数。
+
+        飞书 message_id 由服务端在发送成功后才生成，无法预生成幂等键，
+        因此按「收件人 + 正文精确匹配」查重（应用层查表，§4-A.1a 边界内）：
+        同内容已成功发出的不再重发；简历包文件消息无法用文本通道补发，留给人工。
+        """
+        failed = await self.messages.list_failed_outbound(channel=Channel.FEISHU)
+        resent = 0
+        for record in failed:
+            if not record.recipient or not record.body:
+                continue
+            if (record.parsed or {}).get("kind") == "resume_package_file":
+                logger.warning(
+                    "retry.feishu_file_manual",
+                    extra=log_extra(recipient=record.recipient, message_id=record.external_id),
+                )
+                continue
+            delivered = await self.messages.find_delivered_by_content(
+                channel=Channel.FEISHU, recipient=record.recipient, body=record.body
+            )
+            if delivered is not None:
+                continue
+            result = await self.feishu.send_text(record.recipient, record.body)
+            await self._record_feishu_out(
+                recipient=record.recipient,
+                body=record.body,
+                message_id=result.message_id,
+                ok=result.ok,
+                error=result.error,
+                position_id=record.position_id,
+                candidate_id=record.candidate_id,
+                thread_key=record.thread_key,
+                parsed=record.parsed or {"kind": "retry"},
+            )
+            if result.ok:
+                resent += 1
+                logger.info(
+                    "retry.feishu.done",
+                    extra=log_extra(recipient=record.recipient, message_id=result.message_id),
+                )
+            else:
+                logger.warning(
+                    "retry.feishu.failed",
+                    extra=log_extra(recipient=record.recipient, error=result.error),
+                )
+        await self.session.commit()
+        return resent
 
     async def send_reschedule_confirmation(
         self,
