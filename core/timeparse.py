@@ -53,6 +53,10 @@ _RELATIVE_DAYS: dict[str, int] = {"今天": 0, "今日": 0, "明天": 1, "明日
 
 _ISO_DATE_RE = re.compile(r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})[日号]?")
 _CN_MONTH_DAY_RE = re.compile(r"(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?")
+# E-01：「下个月5号」「下月十五日」——相对月份 + 具体日，独立于上面两个绝对日期正则
+_NEXT_MONTH_DAY_RE = re.compile(
+    r"下个?月\s*(\d{1,2}|[一二三四五六七八九十]{1,3})\s*[日号]"
+)
 _WEEK_RE = re.compile(r"(上上|下下|上|下|本|这)?\s*(?:周|星期|礼拜)\s*([一二三四五六日天1-7])")
 _TIME_RE = re.compile(
     r"(凌晨|早上|早晨|清晨|上午|中午|下午|傍晚|晚上|晚)?\s*"
@@ -125,6 +129,21 @@ def format_datetime(naive_utc: datetime | None, tz: str = DEFAULT_TZ, fmt: str =
 
 
 def _parse_date(text: str, now: datetime) -> date | None:
+    # E-01：「下个月 X 号」是主管原话里最常见、也最容易丢时间的表达。
+    # 独立拦截，命中即返回；不命中则完全走下面原有分支（未改动任何既有逻辑）。
+    next_month = _NEXT_MONTH_DAY_RE.search(text)
+    if next_month:
+        day = cn_to_int(next_month.group(1))
+        if day is None:
+            return None
+        # 下个月 1 号：+32 天必落在下个月，再归到 1 号
+        first_of_next_month = (now.date().replace(day=1) + timedelta(days=32)).replace(day=1)
+        try:
+            return first_of_next_month.replace(day=day)
+        except ValueError:
+            # 下个月没有这一天（如 2 月 30 号）→ 不猜，交给调用方向主管追问（I-01）
+            return None
+
     match = _ISO_DATE_RE.search(text)
     if match:
         year, month, day = (int(g) for g in match.groups())

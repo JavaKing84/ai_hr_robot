@@ -99,3 +99,36 @@ def test_reschedule_time_falls_back_to_any_expression() -> None:
     parsed = parse_reschedule_time("周四下午三点可以吗", now=NOW, tz="Asia/Shanghai")
     assert parsed is not None
     assert parsed.date() == datetime(2026, 11, 5).date()
+
+
+# ---------------------------------------------------------------------------
+# E-01：相对月份「下个月 X 号」
+# 保护不变量 I-01（时间只能来自主管）：主管原话就是「下个月5号」时，若解析不出来，
+# 只能走「追时间」分支，等于把主管已经给出的时间弄丢了。这里锁定能解析、且年月日正确。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("下个月5号", datetime(2026, 12, 5, 10, 0)),
+        ("下月5号", datetime(2026, 12, 5, 10, 0)),
+        ("下个月15号下午2点", datetime(2026, 12, 15, 14, 0)),
+        ("下个月1号上午九点半", datetime(2026, 12, 1, 9, 30)),
+        ("下个月28日 10:00", datetime(2026, 12, 28, 10, 0)),
+    ],
+)
+def test_next_month_day_parsed(text: str, expected: datetime) -> None:
+    """只给日期不给时间时仍走既有 default_hour=10 兜底，语义不变。"""
+    parsed = parse_chinese_datetime(text, now=NOW, tz="Asia/Shanghai")
+    assert parsed is not None, f"「{text}」应解析出下个月的日期，实际返回 None（E-01 未修复）"
+    assert parsed.replace(tzinfo=None) == expected
+
+
+def test_next_month_day_does_not_steal_other_expressions() -> None:
+    """新增的月份拦截不能把既有的绝对日期/周表达抢走（回归保护）。"""
+    assert parse_chinese_datetime("12月5号上午10点", now=NOW, tz="Asia/Shanghai") == datetime(
+        2026, 12, 5, 10, 0, tzinfo=TZ
+    )
+    next_week = parse_chinese_datetime("下周三下午2点", now=NOW, tz="Asia/Shanghai")
+    assert next_week is not None and next_week.date() == datetime(2026, 11, 11).date()
