@@ -17,5 +17,7 @@ python-multipart>=0.0.9
 pypdf>=4.0
 python-docx>=1.1
 larksuite-oapi>=1.0.20
+# LLM 统一网关：多供应商入口 + 失败自动降级（§4-A.6b，仅此一个新增依赖）
+litellm>=1.50
 # 简历文本提取（ETL 分层）：未安装时 client/resume_parser.py 自动降级到 pypdf / python-docx
 unstructured[pdf,docx]>=0.14

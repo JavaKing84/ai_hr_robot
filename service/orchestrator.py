@@ -87,7 +87,7 @@ class Orchestrator:
         try:
             await self.sync_config()
         except Exception as exc:  # noqa: BLE001 - 配置同步失败时用库里已有职位继续
-            logger.exception("cycle.sync_failed")
+            logger.exception("cycle.sync_failed", extra=log_extra(cycle_id=cycle_id))
             errors.append(f"配置同步失败：{exc}")
 
         # 1) 收简历 + 处理已到达的邮件回复（同一个轮询，避免互相吞邮件）
@@ -95,7 +95,7 @@ class Orchestrator:
             poll = await self.inbound.poll_once(cycle_id=cycle_id)
             errors.extend(poll.errors)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("cycle.poll_failed")
+            logger.exception("cycle.poll_failed", extra=log_extra(cycle_id=cycle_id))
             poll = EmailPollResponse(errors=[str(exc)])
             errors.append(f"邮箱轮询失败：{exc}")
 
@@ -113,8 +113,25 @@ class Orchestrator:
         try:
             packages = await self.notification.dispatch_cycle(cycle_id)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("cycle.dispatch_failed")
+            logger.exception("cycle.dispatch_failed", extra=log_extra(cycle_id=cycle_id))
             errors.append(f"分发给主管失败：{exc}")
+
+        # 3) 幂等补发上一轮失败的出站消息（§4-A.1b：按幂等键查重后安全补发，不产生重复消息）
+        try:
+            notice_results = await self.notification.retry_failed_interview_notices()
+            feishu_resent = await self.notification.retry_failed_feishu_messages()
+            logger.info(
+                "cycle.notice_retry",
+                extra=log_extra(
+                    cycle_id=cycle_id,
+                    email_retried=len(notice_results),
+                    email_ok=len([r for r in notice_results if r.ok]),
+                    feishu_resent=feishu_resent,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - 补发失败不影响本轮主流程
+            logger.exception("cycle.notice_retry_failed", extra=log_extra(cycle_id=cycle_id))
+            errors.append(f"补发失败消息异常：{exc}")
 
         response = RunCycleResponse(
             cycle_id=cycle_id,
@@ -137,7 +154,10 @@ class Orchestrator:
             note="本轮任务完成：简历已筛选并分发给主管，等待主管反馈后发面试邮件",
         )
         await self.session.commit()
-        logger.info("cycle.completed", extra=log_extra(**response.model_dump(mode="json")))
+        elapsed_ms = int((now_utc_naive() - triggered_at).total_seconds() * 1000)
+        payload = response.model_dump(mode="json")
+        payload["elapsed_ms"] = elapsed_ms
+        logger.info("cycle.completed", extra=log_extra(**payload))
         return response
 
     async def poll_inbound(self) -> EmailPollResponse:

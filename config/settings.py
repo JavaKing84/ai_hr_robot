@@ -37,8 +37,8 @@ class Settings(BaseSettings):
     port: int = 8000
     timezone: str = "Asia/Shanghai"
 
-    # 数据库
-    database_url: str = "sqlite+aiosqlite:///./var/hr_robot.db"
+    # 数据库（开发/生产默认 PostgreSQL；测试由 tests/conftest.py 注入 SQLite 覆盖）
+    database_url: str = "postgresql+asyncpg://hr:hr@localhost:5432/hr_robot"
     db_echo: bool = False
 
     # 路径
@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: str = ""
     llm_model: str = "gpt-4o-mini"
+    llm_fallback_models: str = ""
     llm_timeout_seconds: float = Field(default=45.0, gt=0)
 
     # 邮件
@@ -111,6 +112,11 @@ class Settings(BaseSettings):
         if self.llm_mode == "live":
             return True
         return bool(self.openai_api_key)
+
+    @property
+    def llm_fallback_model_list(self) -> list[str]:
+        """``LLM_FALLBACK_MODELS`` 逗号分隔的降级候选模型列表（已去空、去重）。"""
+        return [m.strip() for m in self.llm_fallback_models.split(",") if m.strip()]
 
     @property
     def mail_live(self) -> bool:

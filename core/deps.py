@@ -141,6 +141,8 @@ def build_services(session: AsyncSession, container: Container | None = None) ->
         extraction=extraction,
         llm=llm,
         company_name=company.company.name,
+        feishu=container.feishu,
+        hr_alert_open_id=_first_supervisor_open_id(company),
     )
     threads = EmailThreadService(session, settings)
     feedback = FeedbackService(
@@ -183,6 +185,22 @@ def build_services(session: AsyncSession, container: Container | None = None) ->
         inbound=inbound,
         orchestrator=orchestrator,
     )
+
+
+# ------------------------------------------------------------------ 配置派生
+
+
+def _first_supervisor_open_id(company: CompanyConfig) -> str:
+    """取第一个有效主管飞书 open_id 作为「未归位简历」告警接收人。
+
+    复用 ``config/positions.yaml`` 既有的主管映射，不新增任何配置项（§4-A 总纲 P1）。
+    没有配置主管 open_id 时返回空串，由 IngestionService 降级为日志告警。
+    """
+    for department in company.departments:
+        open_id = (department.supervisor.feishu_open_id or "").strip()
+        if open_id:
+            return open_id
+    return ""
 
 
 # ------------------------------------------------------------------ FastAPI 依赖

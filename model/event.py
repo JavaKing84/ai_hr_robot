@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Integer, String, Text
+from sqlalchemy import JSON, BigInteger, DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db import Base
@@ -27,7 +27,7 @@ class Event(TimestampMixin, Base):
     action: Mapped[str] = mapped_column(String(64), index=True)
     actor: Mapped[str] = mapped_column(String(32), default=Actor.ROBOT)
     object_type: Mapped[str] = mapped_column(String(32), default="candidate")
-    object_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    object_id: Mapped[int | None] = mapped_column(BigInteger, index=True, nullable=True)
 
     from_state: Mapped[str] = mapped_column(String(32), default="")
     to_state: Mapped[str] = mapped_column(String(32), default="")

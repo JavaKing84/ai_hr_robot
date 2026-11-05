@@ -1,7 +1,12 @@
-"""LLM 客户端：OpenAI 兼容 ``/chat/completions``，只负责“把 JSON 拿回来”。
+"""LLM 客户端：经 litellm 统一网关调用，只负责“把 JSON 拿回来”。
 
-- 不绑定任何厂商 SDK；``OPENAI_BASE_URL`` / ``OPENAI_API_KEY`` / ``LLM_MODEL`` 全部来自环境变量。
-- ``llm_mode=auto`` 且没有 key 时抛 ``LLMUnavailable``，调用方降级到确定性规则抽取，
+- 多供应商统一入口由 ``litellm.acompletion`` 承担，模型名即供应商前缀（``gpt-4o-mini`` /
+  ``claude-3-5-sonnet`` / ``gemini/...`` 等），``OPENAI_API_KEY`` 等凭证由 litellm 按供应商路由。
+- 失败自动降级顺序：主模型 ``LLM_MODEL`` → 依序尝试 ``LLM_FALLBACK_MODELS`` 逗号分隔列表 →
+  全部失败抛 ``LLMUnavailable``，由调用方（screening / extraction）落到确定性规则抽取。
+- **降级只发生在「调用失败 / 超时 / 无 key」**，绝不因“LLM 返回了结果但抽取不理想”而降级
+  （那会绕过 I-05 姓名接地）。
+- ``llm_mode=off`` 或无 key 时抛 ``LLMUnavailable``，调用方降级到确定性规则抽取，
   这样离线 / 无凭证环境下整条闭环依然可以跑通（见 DECISIONS.md）。
 """
 
@@ -10,8 +15,6 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
-
-import httpx
 
 from config.settings import Settings
 from core.exceptions import ExternalServiceError, LLMUnavailable
@@ -36,24 +39,63 @@ def strip_json_fence(content: str) -> str:
 
 
 class LLMClient:
-    def __init__(self, settings: Settings, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
+    def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self._transport = transport
-        self._client: httpx.AsyncClient | None = None
 
     @property
     def enabled(self) -> bool:
         return self.settings.llm_enabled
 
-    def _http(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                base_url=self.settings.openai_base_url.rstrip("/"),
-                timeout=self.settings.llm_timeout_seconds,
-                transport=self._transport,
-                headers={"Authorization": f"Bearer {self.settings.openai_api_key}"},
-            )
-        return self._client
+    def _candidate_models(self) -> list[str]:
+        """返回尝试顺序：主模型 → fallback 列表（已去空去重、并排除主模型自身）。"""
+        primary = self.settings.llm_model.strip()
+        fallbacks = [m for m in self.settings.llm_fallback_model_list if m != primary]
+        ordered = [primary] if primary else []
+        ordered.extend(fallbacks)
+        # 去重保序
+        seen: set[str] = set()
+        result: list[str] = []
+        for m in ordered:
+            if m not in seen:
+                seen.add(m)
+                result.append(m)
+        return result
+
+    async def _call_litellm(self, model: str, *, system: str, user: str, temperature: float, max_tokens: int) -> dict[str, Any]:
+        import litellm  # 延迟导入：无 LLM 场景（规则抽取主路径）不加载该依赖
+
+        response = await litellm.acompletion(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            api_base=self.settings.openai_base_url.rstrip("/"),
+            api_key=self.settings.openai_api_key or None,
+            timeout=self.settings.llm_timeout_seconds,
+        )
+
+        try:
+            content = response["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ExternalServiceError(
+                f"LLM 响应结构异常: {response}", code="llm_bad_response"
+            ) from exc
+
+        if content is None:
+            raise ExternalServiceError("LLM 返回空内容", code="llm_bad_response")
+
+        try:
+            parsed = json.loads(strip_json_fence(str(content)))
+        except json.JSONDecodeError as exc:
+            raise ExternalServiceError(
+                f"LLM 返回内容不是合法 JSON: {str(content)[:300]}", code="llm_bad_json"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise ExternalServiceError("LLM 返回的 JSON 顶层必须是对象", code="llm_bad_json")
+        return parsed
 
     async def complete_json(
         self,
@@ -67,49 +109,40 @@ class LLMClient:
         if not self.enabled:
             raise LLMUnavailable("LLM 未启用（缺少 OPENAI_API_KEY 或 LLM_MODE=off）")
 
-        payload: dict[str, Any] = {
-            "model": self.settings.llm_model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
-        }
+        models = self._candidate_models()
+        if not models:
+            raise LLMUnavailable("未配置任何 LLM 模型（LLM_MODEL 为空）")
 
-        try:
-            response = await self._http().post("/chat/completions", json=payload)
-            if response.status_code == 400:
-                # 部分兼容实现不支持 response_format，去掉后重试一次
-                payload.pop("response_format", None)
-                response = await self._http().post("/chat/completions", json=payload)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise ExternalServiceError(
-                f"LLM 返回错误状态 {exc.response.status_code}: {exc.response.text[:300]}",
-                code="llm_http_error",
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise ExternalServiceError(f"LLM 调用失败: {exc}", code="llm_network_error") from exc
+        last_error: Exception | None = None
+        for model in models:
+            try:
+                return await self._call_litellm(
+                    model,
+                    system=system,
+                    user=user,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except (ExternalServiceError, LLMUnavailable) as exc:
+                # 结构化错误（响应结构 / 非法 JSON）属于“模型返回了但不可用”，
+                # 主模型命中的结构错误同样允许尝试下一个模型（仍属调用失败范畴，
+                # 不涉及“抽取不理想就降级”的语义判断）。
+                last_error = exc
+                logger.warning(
+                    "llm.call_failed",
+                    extra={"model": model, "error": str(exc)},
+                )
+            except Exception as exc:  # noqa: BLE001 - litellm 抛出的底层异常统一视为调用失败
+                last_error = exc
+                logger.warning(
+                    "llm.call_failed",
+                    extra={"model": model, "error": f"{type(exc).__name__}: {exc}"},
+                )
 
-        data = response.json()
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise ExternalServiceError(f"LLM 响应结构异常: {data}", code="llm_bad_response") from exc
-
-        try:
-            parsed = json.loads(strip_json_fence(content))
-        except json.JSONDecodeError as exc:
-            raise ExternalServiceError(
-                f"LLM 返回内容不是合法 JSON: {content[:300]}", code="llm_bad_json"
-            ) from exc
-        if not isinstance(parsed, dict):
-            raise ExternalServiceError("LLM 返回的 JSON 顶层必须是对象", code="llm_bad_json")
-        return parsed
+        # 全部失败：收敛为 LLMUnavailable，交由调用方落到确定性规则抽取
+        logger.warning("llm.all_fallback_failed", extra={"models": models, "error": str(last_error)})
+        raise LLMUnavailable(f"LLM 主模型与全部 fallback 均调用失败: {last_error}") from last_error
 
     async def close(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        # litellm 无长连接客户端需要显式关闭；保留此方法以维持接口稳定。
+        return None

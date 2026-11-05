@@ -32,6 +32,57 @@ class MessageRepository(BaseRepository[Message]):
         )
         return result.scalars().first()
 
+    async def find_delivered(self, external_id: str) -> Message | None:
+        """幂等防重（§4-A.1a）：同一 external_id 是否已有成功发出的出站记录。
+
+        只认 ``sent`` / ``mocked``（成功）；``failed`` 记录不拦截，允许按原键补发。
+        """
+        if not external_id:
+            return None
+        result = await self.session.execute(
+            select(Message)
+            .where(
+                Message.external_id == external_id,
+                Message.direction == Direction.OUTBOUND,
+                Message.status.in_(("sent", "mocked")),
+            )
+            .limit(1)
+        )
+        return result.scalars().first()
+
+    async def find_delivered_by_content(
+        self, *, channel: str, recipient: str, body: str
+    ) -> Message | None:
+        """内容级幂等查重：飞书 message_id 由服务端生成、发送前不存在，
+        因此对飞书出站按「收件人 + 正文精确匹配」判重（应用层查表，§4-A.1a 边界内）。"""
+        if not recipient or not body:
+            return None
+        result = await self.session.execute(
+            select(Message)
+            .where(
+                Message.channel == channel,
+                Message.direction == Direction.OUTBOUND,
+                Message.recipient == recipient,
+                Message.body == body,
+                Message.status.in_(("sent", "mocked")),
+            )
+            .limit(1)
+        )
+        return result.scalars().first()
+
+    async def list_failed_outbound(self, *, channel: str) -> list[Message]:
+        """失败的出站记录（补发入口的数据源，按 id 升序）。"""
+        result = await self.session.execute(
+            select(Message)
+            .where(
+                Message.channel == channel,
+                Message.direction == Direction.OUTBOUND,
+                Message.status == "failed",
+            )
+            .order_by(Message.id)
+        )
+        return list(result.scalars().all())
+
     async def list_recent(
         self, *, channel: str | None = None, direction: str | None = None, limit: int = 50
     ) -> list[Message]:
