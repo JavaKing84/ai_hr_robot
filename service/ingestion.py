@@ -7,16 +7,19 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from client.feishu import FeishuClient
 from client.mailbox import InboundEmail, MailboxClient
 from client.resume_parser import ParsedResume, ResumeParser
 from config.settings import Settings
 from core.logging import get_logger, log_extra
+from core.safe_process import run_in_subprocess
 from core.timeparse import now_utc_naive
 from model.candidate import Candidate, CandidateStatus
 from model.event import Actor
@@ -34,6 +37,11 @@ from schema.screening import ScreeningResult
 logger = get_logger(__name__)
 
 _RESUME_SUFFIXES = (".pdf", ".doc", ".docx", ".txt", ".md")
+
+#: 单份简历解析的硬超时（秒）。损坏 PDF 可能让解析器卡死，必须有个上限。
+_PARSE_TIMEOUT_SECONDS = 60.0
+#: 解析子进程失败时挂在 ParsedResume.engine 上的标记（用于日志与告警区分）。
+PARSE_FAILED_ENGINE = "subprocess-failed"
 
 
 @dataclass
@@ -56,6 +64,8 @@ class IngestionService:
         extraction: ExtractionService,
         llm: Any = None,
         company_name: str = "",
+        feishu: FeishuClient | None = None,
+        hr_alert_open_id: str = "",
     ) -> None:
         self.session = session
         self.settings = settings
@@ -63,6 +73,8 @@ class IngestionService:
         self.extraction = extraction
         self.llm = llm
         self.company_name = company_name
+        self.feishu = feishu
+        self.hr_alert_open_id = hr_alert_open_id
         self.candidates = CandidateRepository(session)
         self.positions = PositionRepository(session)
         self.events = EventRepository(session)
@@ -144,12 +156,10 @@ class IngestionService:
         prefetched: ParsedResume | None = None,
     ) -> IngestOutcome:
         """核心入库流程（两个入口共用）。"""
-        parsed = prefetched or await self.parser.save_and_parse(data, filename)
+        parsed = prefetched or await self._parse_resume_safely(data, filename)
 
         active_positions = await self.positions.list_active()
-        if not active_positions:
-            return IngestOutcome(candidate=None, note="没有在招职位，简历已保存但无法归位")
-
+        # 抽取放在归位判断之前：无论能否归位都要抽姓名/联系方式，未归位时仍要留档。
         extracted = await self.extraction.extract_candidate(
             parsed.text,
             filename=parsed.filename,
@@ -157,11 +167,20 @@ class IngestionService:
         )
         self._apply_contact_hint(extracted, contact_hint)
 
+        if not active_positions:
+            return await self._store_unmatched(
+                parsed, extracted, source=source, cycle_id=cycle_id,
+                reason="没有在招职位（配置为空）",
+            )
+
         position, match_note = self._resolve_position(
             parsed.text, extracted, active_positions, explicit_code=position_code
         )
         if position is None:
-            return IngestOutcome(candidate=None, note=f"无法归位到任何在招职位（{match_note}）")
+            return await self._store_unmatched(
+                parsed, extracted, source=source, cycle_id=cycle_id,
+                reason=f"无法归位到任何在招职位（{match_note}）",
+            )
 
         now = now_utc_naive()
         duplicate = await self.candidates.find_duplicate(email=extracted.email, phone=extracted.phone)
@@ -274,6 +293,128 @@ class IngestionService:
         )
 
     # ------------------------------------------------------------------ 内部
+    async def _parse_resume_safely(self, data: bytes, filename: str) -> ParsedResume:
+        """在子进程里执行解析，崩溃/超时都降级成「空文本 + warnings」，绝不中断本轮。
+
+        解析器（pypdf / unstructured 的 C 扩展）遇到损坏 PDF 时可能直接段错误或卡死，
+        这类失败在主进程里 try/except 兜不住，会让整轮 ``dispatch_cycle`` 一起消失——
+        与本项目 I-10「单份失败不影响其他」同一条思路：隔离到子进程，失败只影响这一份。
+        """
+        result = await asyncio.to_thread(
+            run_in_subprocess,
+            self.parser.save_and_parse,
+            data,
+            filename,
+            timeout=_PARSE_TIMEOUT_SECONDS,
+        )
+        if result.ok and isinstance(result.value, ParsedResume):
+            return result.value
+
+        reason = result.reason or "未知原因"
+        logger.warning(
+            "ingest.parse_subprocess_failed",
+            extra=log_extra(file=filename, reason=reason, timed_out=result.timed_out),
+        )
+        # 降级而不是抛出：后续流程照常走（抽取得到空内容 → 未归位留档 + 告警），
+        # 保证「一封简历解析失败」不会让这一轮的其他简历不被处理。
+        return ParsedResume(
+            filename=filename,
+            path="",
+            text="",
+            engine=PARSE_FAILED_ENGINE,
+            warnings=[f"解析子进程失败（{reason}），已降级为空文本，请人工确认该简历"],
+        )
+
+    async def _store_unmatched(
+        self,
+        parsed: ParsedResume,
+        extracted: ExtractedCandidate,
+        *,
+        source: str,
+        cycle_id: int | None,
+        reason: str,
+    ) -> IngestOutcome:
+        """降级入库：无法归位时仍保留候选人记录（status=received、position_id=None），
+        追加 unmatched 事件并触发飞书告警——**不抛异常**，保证批处理继续处理下一封。
+
+        严格遵循 §4-A.1 子任务 2：不修改 CandidateStatus 的 10 个枚举值，
+        仅将未归位者停留在 received 状态并留痕。
+        """
+        now = now_utc_naive()
+        candidate = Candidate(
+            name=extracted.name or _fallback_name(parsed.filename, extracted.email),
+            email=extracted.email,
+            phone=extracted.phone,
+            position_id=None,
+            position_code="",
+            department="",
+            education_level=extracted.education_level,
+            school=extracted.school,
+            major=extracted.major,
+            years_experience=extracted.years_experience,
+            skills=list(extracted.skills or []),
+            project_highlights=list(extracted.project_highlights or []),
+            summary=extracted.summary,
+            structured=extracted.model_dump(mode="json"),
+            resume_path=parsed.path,
+            resume_filename=parsed.filename,
+            resume_text=parsed.text[:50_000],
+            source=source,
+            status=CandidateStatus.RECEIVED,
+            first_seen_at=now,
+            last_seen_at=now,
+            cycle_id=cycle_id,
+        )
+        await self.candidates.add(candidate)
+        await self.events.record(
+            "candidate.received",
+            actor=Actor.ROBOT,
+            object_type="candidate",
+            object_id=candidate.id,
+            to_state=CandidateStatus.RECEIVED,
+            detail={"unmatched": True, "reason": reason},
+        )
+        await self.events.record(
+            "candidate.unmatched_position",
+            actor=Actor.ROBOT,
+            object_type="candidate",
+            object_id=candidate.id,
+            to_state=CandidateStatus.RECEIVED,
+            detail={"name": candidate.name, "email": candidate.email, "reason": reason},
+            note=f"无法自动归位：{reason}",
+        )
+        await self.session.commit()
+        await self._alert_unmatched(candidate, reason)
+        return IngestOutcome(
+            candidate=candidate,
+            created=True,
+            position_code="",
+            note=f"未归位（{reason}），已留档待人工分配职位",
+        )
+
+    async def _alert_unmatched(self, candidate: Candidate, reason: str) -> None:
+        """飞书告警（service 层编排，client 只负责发送）。
+
+        无客户端或无接收人（如配置里没有主管 open_id）时降级为日志告警，
+        不抛异常、不阻断流程。
+        """
+        if self.feishu is None or not self.hr_alert_open_id:
+            logger.warning(
+                "ingest.unmatched_no_alert",
+                extra=log_extra(candidate_id=candidate.id, reason=reason),
+            )
+            return
+        text = (
+            f"⚠️ 收到一份无法自动归位的简历（候选人：{candidate.name or '未知'}），"
+            f"请人工介入分配职位。原因：{reason}"
+        )
+        result = await self.feishu.send_text(self.hr_alert_open_id, text)
+        if not result.ok:
+            logger.warning(
+                "ingest.unmatched_alert_failed",
+                extra=log_extra(candidate_id=candidate.id, error=result.error),
+            )
+
     @staticmethod
     def _apply_contact_hint(extracted: ExtractedCandidate, hint: dict[str, str] | None) -> None:
         if not hint:
