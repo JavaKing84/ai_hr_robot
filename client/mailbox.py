@@ -243,6 +243,23 @@ class MailboxClient:
         logger.info("mail.mock.polled", extra=log_extra(count=len(results)))
         return results
 
+    #: RFC 2971 的客户端身份声明。**网易系邮箱（163/126/yeah.net/企业邮）在 SELECT
+    #: 之前强制要求这条命令**，否则返回
+    #: ``SELECT Unsafe Login. Please contact kefu@188.com for help``。
+    #: 其他服务器不支持时回 BAD，忽略即可，不影响后续命令。
+    _IMAP_ID_ARGS = '("name" "ai-hr-robot" "version" "1.0" "vendor" "ai-hr")'
+
+    @classmethod
+    def _send_imap_id(cls, client: imaplib.IMAP4) -> None:
+        """登录后、SELECT 前声明客户端身份（网易邮箱必需）。"""
+        imaplib.Commands.setdefault("ID", ("AUTH", "SELECTED"))
+        try:
+            typ, dat = client._simple_command("ID", cls._IMAP_ID_ARGS)
+            client._untagged_response(typ, dat, "ID")
+            logger.debug("mail.imap.id_sent", extra=log_extra(status=typ))
+        except Exception as exc:  # noqa: BLE001 - 握手失败不应中断收信
+            logger.debug("mail.imap.id_failed", extra=log_extra(error=str(exc)))
+
     def _live_poll(self) -> list[InboundEmail]:
         if not self.settings.imap_host:
             raise MailboxUnavailable("缺少 IMAP_HOST，无法收信")
@@ -260,7 +277,12 @@ class MailboxClient:
         try:
             with client_cls(self.settings.imap_host, self.settings.imap_port) as client:
                 client.login(self.settings.imap_user, self.settings.imap_password)
-                client.select(self.settings.imap_inbox or "INBOX")
+                self._send_imap_id(client)
+                status, _ = client.select(self.settings.imap_inbox or "INBOX")
+                if status != "OK":
+                    raise MailboxUnavailable(
+                        f"IMAP 选择信箱失败（{status}）：请确认已开启 IMAP、imap_inbox 名称正确"
+                    )
                 status, data = client.uid("search", None, f"UID {last_uid + 1}:*")
                 if status != "OK":
                     raise MailboxUnavailable(f"IMAP search 失败: {status}")

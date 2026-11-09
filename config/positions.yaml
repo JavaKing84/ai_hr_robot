@@ -2,8 +2,8 @@
 # ai-hr 业务配置（HR 可直接编辑，下一轮定时任务即生效）
 #
 # 结构：company / schedule / mailbox / departments[] -> supervisor + positions[]
-#   - supervisor.feishu_open_id：机器人向谁发简历包与对话（飞书）
-#   - supervisor.email：简历包副本抄送地址，主管可直接在“原邮件”上回复面试名单
+#   - supervisor.feishu_open_id：ou_241baa285164063f94a0f3dcf7f2459e
+#   - supervisor.email：18786112948@163.com
 #   - positions[].screening：硬性条件（不过即淘汰）+ 加权项（0-100 归一化打分）
 #   - threshold：加权得分及格线，低于此线视为未通过
 #   - keywords：简历未写明应聘岗位时，用关键词把简历归位到该职位
@@ -32,8 +32,8 @@ departments:
     supervisor:
       name: 张伟
       title: 张总
-      feishu_open_id: ou_mock_zhangwei
-      email: zhangwei@xingye-test.com
+      feishu_open_id: ou_241baa285164063f94a0f3dcf7f2459e
+      email: 18786112948@163.com
     positions:
       - code: backend_senior
         title: 高级后端工程师
