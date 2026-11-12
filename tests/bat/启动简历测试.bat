@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-cd /d "%~dp0"
+cd /d "%~dp0..\.."
 set PYTHONIOENCODING=utf-8
 if not exist "var" mkdir "var"
 echo ============================================
