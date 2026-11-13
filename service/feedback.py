@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Sequence
@@ -47,6 +48,21 @@ _SCHEDULABLE_STATUSES = (
 )
 _APPROVAL_WORDS = ("同意", "可以", "没问题", "行", "好的", "都行", "就这么定", "按这个时间")
 
+# ---------------------------------------------------------------- 面试通知人工确认
+# 机器人先把通知挂起，并在飞书里请示；HR 回复下面这些词才真正投递。
+_CONFIRM_NOTICE_RE = re.compile(
+    r"(确认发送|确认|确定|同意发送|同意|全部发送|都发|发送|发出去|发吧|可以发|send|approve)",
+    re.IGNORECASE,
+)
+_CANCEL_NOTICE_RE = re.compile(
+    r"(取消|不发|别发|先别发|不要发|作废|暂缓|cancel|reject)", re.IGNORECASE
+)
+# 带时间表达的回复说明是「安排面试」，不能当成对通知的确认
+_TIME_EXPR_RE = re.compile(
+    r"(\d{1,2}\s*[:：]\s*\d{2}|\d{1,2}\s*[点时]|周[一二三四五六日天]|星期[一二三四五六日天]"
+    r"|明天|后天|今天|上午|下午|晚上|下周|本周)"
+)
+
 
 @dataclass
 class FeedbackOutcome:
@@ -81,6 +97,10 @@ class FeedbackService:
     # ------------------------------------------------------------------ 入口
     async def handle(self, inbound: InboundMessage) -> FeedbackOutcome:
         supervisor = await self._resolve_supervisor(inbound)
+        # HR 本人不一定登记为主管：只要有待确认的面试通知，就允许他回「确认/取消」。
+        if supervisor is None and (self.settings.hr_feishu_open_id or "").strip() == inbound.sender_id:
+            if await self.notification.pending_interview_notices():
+                supervisor = await self._any_supervisor()
         if supervisor is None:
             await self.events.record(
                 "feedback.supervisor_unknown",
@@ -98,6 +118,14 @@ class FeedbackService:
             return FeedbackOutcome(handled=False, action="no_position", reply_text="该主管名下没有在招职位")
 
         message_row = await self._record_inbound(inbound, supervisor)
+
+        # 场景 0：HR 在飞书里回复「确认 / 确认 1,3 / 取消」，放行或作废挂起的面试通知。
+        # 放在最前面：这类回复既没有候选人名单也没有时间，交给排期解析会误判。
+        approval = await self._handle_interview_approval(inbound, supervisor, message_row)
+        if approval is not None:
+            await self.session.commit()
+            return approval
+
         active = await self.candidates.list_active_for_positions(
             [p.id for p in positions], statuses=list(_SCHEDULABLE_STATUSES)
         )
@@ -115,6 +143,99 @@ class FeedbackService:
         outcome = await self._handle_schedule(inbound, supervisor, positions, active, message_row)
         await self.session.commit()
         return outcome
+
+    # ------------------------------------------- 场景 0：确认/取消面试通知投递
+    async def _handle_interview_approval(
+        self,
+        inbound: InboundMessage,
+        supervisor: Supervisor,
+        message_row: Message,
+    ) -> FeedbackOutcome | None:
+        """处理 HR 对「待确认面试通知」的确认/取消回复。
+
+        返回 ``None`` 表示这条消息不是审批指令（可能是名单+时间），继续走排期解析。
+        支持：「确认」「确认发送」「发送」「确认 1,3」「取消」「取消 2」。
+        """
+        text = (inbound.text or "").strip()
+        if not text:
+            return None
+
+        pending = await self.notification.pending_interview_notices()
+        if not pending:
+            return None
+
+        # 带时间/日期表达的回复是「安排面试」，不当成对通知的答复
+        if _TIME_EXPR_RE.search(text):
+            return None
+
+        cancel = _CANCEL_NOTICE_RE.search(text)
+        confirm = _CONFIRM_NOTICE_RE.search(text)
+        if not cancel and not confirm:
+            return None
+
+        # 序号对应请示消息里的编号（与 pending_interview_notices 的 id 顺序一致）
+        numbers = [int(n) for n in re.findall(r"\d+", text)]
+        targets: list[Message] = []
+        for n in numbers:
+            if 1 <= n <= len(pending):
+                targets.append(pending[n - 1])
+        if not targets:
+            targets = list(pending)
+        target_ids = [row.id for row in targets]
+
+        if cancel and not confirm:
+            cancelled = await self.notification.cancel_pending_interview_notices(target_ids)
+            reply = (
+                f"已取消 {cancelled} 份待确认的面试通知，候选人不会收到任何邮件。\n"
+                "需要重新安排的话，把名单和时间再发我一次即可。"
+            )
+            await self.notification.notify_supervisor(
+                self._approval_open_id(supervisor),
+                reply,
+                kind="interview_approval_cancelled",
+            )
+            await self.events.record(
+                "interview.approval_cancelled",
+                actor=Actor.HR,
+                object_type="message",
+                object_id=message_row.id,
+                detail={"cancelled": cancelled, "message_ids": target_ids, "text": text[:200]},
+                note=f"HR 在飞书取消 {cancelled} 份面试通知（未投递）",
+            )
+            return FeedbackOutcome(
+                handled=True,
+                action="interview_notice_cancelled",
+                detail={"cancelled": cancelled, "message_ids": target_ids},
+                reply_text=reply,
+            )
+
+        results = await self.notification.confirm_pending_interview_notices(target_ids)
+        ok = len([r for r in results if r.ok])
+        failed = len(results) - ok
+        reply = f"已按您的确认发送 {ok} 份面试通知。"
+        if failed:
+            reply += f"另有 {failed} 份发送失败，我会稍后重试。"
+        await self.notification.notify_supervisor(
+            self._approval_open_id(supervisor), reply, kind="interview_approval_sent"
+        )
+        await self.events.record(
+            "interview.approval_confirmed",
+            actor=Actor.HR,
+            object_type="message",
+            object_id=message_row.id,
+            detail={"sent": ok, "failed": failed, "message_ids": target_ids, "text": text[:200]},
+            note=f"HR 在飞书确认发送面试通知：成功 {ok} 份、失败 {failed} 份",
+        )
+        return FeedbackOutcome(
+            handled=True,
+            action="interview_notice_confirmed",
+            detail={"sent": ok, "failed": failed, "message_ids": target_ids},
+            reply_text=reply,
+        )
+
+    def _approval_open_id(self, supervisor: Supervisor) -> str:
+        """确认请示发给谁：配了 HR 本人 open_id 就发他，否则发触发安排的岗位主管。"""
+        return (self.settings.hr_feishu_open_id or "").strip() or supervisor.feishu_open_id
 
     # ------------------------------------------------------------ 场景 B：安排
     async def _handle_schedule(
@@ -192,6 +313,8 @@ class FeedbackService:
             grouped.setdefault(candidate.position_id or 0, []).append(candidate)
 
         sent_total = 0
+        pending_total = 0
+        receipts: list[tuple[Position, list[Candidate]]] = []
         for position_id, group in grouped.items():
             position = await self.session.get(Position, position_id)
             if position is None:
@@ -219,16 +342,27 @@ class FeedbackService:
             results = await self.notification.send_interview_notices(
                 group, position, interview_time=interview_time, location=location
             )
-            sent_total += len([r for r in results if r.ok])
+            sent_total += len([r for r in results if r.ok and not r.pending])
+            pending_total += len([r for r in results if r.pending])
+            receipts.append((position, list(group)))
 
-            await self.notification.send_receipt_to_supervisor(
-                supervisor.feishu_open_id,
+        # 有待确认的通知：回执换成「请 HR 确认是否发送」的飞书请示，
+        # 在 HR 回复「确认」之前一封都不会投递。
+        if pending_total:
+            await self.notification.request_interview_approval(
+                self._approval_open_id(supervisor),
                 supervisor_title=supervisor.title or supervisor.name,
-                position=position,
-                candidates=group,
-                interview_time=interview_time,
-                location=location,
             )
+        if sent_total:
+            for position, group in receipts:
+                await self.notification.send_receipt_to_supervisor(
+                    supervisor.feishu_open_id,
+                    supervisor_title=supervisor.title or supervisor.name,
+                    position=position,
+                    candidates=group,
+                    interview_time=interview_time,
+                    location=location,
+                )
 
         await self.events.record(
             "feedback.schedule_applied",
@@ -240,9 +374,13 @@ class FeedbackService:
                 "interview_time": interview_time.isoformat(),
                 "location": location,
                 "notices_sent": sent_total,
+                "notices_pending_confirm": pending_total,
                 "source": inbound.channel,
             },
-            note=f"已按主管安排向 {sent_total} 位候选人发送面试通知邮件",
+            note=(
+                f"已按主管安排生成 {sent_total + pending_total} 份面试通知，"
+                f"其中 {sent_total} 份已发送、{pending_total} 份待 HR 确认后发送"
+            ),
         )
         return FeedbackOutcome(
             handled=True,
@@ -252,6 +390,7 @@ class FeedbackService:
                 "interview_time": interview_time.isoformat(),
                 "location": location,
                 "notices_sent": sent_total,
+                "notices_pending_confirm": pending_total,
             },
         )
 
@@ -401,6 +540,14 @@ class FeedbackService:
             )
         )
         return list(result.scalars().all())
+
+    async def _any_supervisor(self) -> Supervisor | None:
+        """取一个名下有在招职位的主管，作为「HR 本人未登记」时的审批身份。"""
+        result = await self.session.execute(select(Supervisor).order_by(Supervisor.id))
+        for candidate_supervisor in result.scalars().all():
+            if await self._positions_of(candidate_supervisor):
+                return candidate_supervisor
+        return None
 
     @staticmethod
     def _primary_position(positions: Sequence[Position], roster: Sequence[Candidate]) -> Position | None:

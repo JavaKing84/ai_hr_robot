@@ -64,6 +64,182 @@ class FeishuClient:
         )
         return self._client
 
+    # ------------------------------------------------------------ 出站：统一入口
+    # 2026-11-13：主管/HR 的推送渠道由「open_id 单聊私信」改为「群机器人」。
+    # 群机器人（自定义机器人）用 webhook 发消息，不需要 app 凭证；但上传文件必须
+    # 用 app 身份（im/v1/files）+ chat_id，因此两条路都留了降级。
+    async def push_text(self, open_id: str, text: str) -> FeishuSendResult:
+        """按 ``FEISHU_PUSH_TARGET`` 决定发群还是发个人私聊。"""
+        if self.settings.feishu_group_push:
+            return await self.send_group_text(text)
+        return await self.send_text(open_id, text)
+
+    async def push_file(
+        self, open_id: str, file_path: str | Path, *, file_name: str | None = None
+    ) -> FeishuSendResult:
+        if self.settings.feishu_group_push:
+            return await self.send_group_file(file_path, file_name=file_name)
+        return await self.send_file(open_id, file_path, file_name=file_name)
+
+    # --------------------------------------------------------- 出站：群机器人
+    async def send_group_text(self, text: str, *, at_all: bool = False) -> FeishuSendResult:
+        """通过自定义机器人 webhook 把文本发到群里。
+
+        群机器人只认 ``msg_type`` 与 ``content``，@人 用 ``<at user_id="ou_xxx"></at>``
+        片段拼在文本里；配置了 ``FEISHU_MENTION_OPEN_IDS`` 就 @ 指定人，否则不发 @。
+        """
+        if not self.settings.feishu_webhook_url:
+            return FeishuSendResult(ok=False, mode=self.mode, error="缺少 FEISHU_WEBHOOK_URL")
+
+        mentions = self.settings.feishu_mention_list
+        content_text = text
+        if at_all:
+            content_text = f'<at user_id="all">所有人</at> {text}'
+        elif mentions:
+            prefix = " ".join(f'<at user_id="{oid}"></at>' for oid in mentions)
+            content_text = f"{prefix} {text}"
+
+        payload: dict[str, Any] = {"msg_type": "text", "content": {"text": content_text}}
+
+        if not self.settings.feishu_live:
+            message_id = f"mock-feishu-group-{uuid.uuid4().hex[:16]}"
+            logger.info(
+                "feishu.mock.send_group_text",
+                extra=log_extra(chars=len(content_text), message_id=message_id),
+            )
+            return FeishuSendResult(ok=True, mode="mock", message_id=message_id)
+
+        return await self._post_webhook(payload, kind="text")
+
+    async def send_group_file(
+        self, file_path: str | Path, *, file_name: str | None = None
+    ) -> FeishuSendResult:
+        """把简历压缩包发到群里。
+
+        自定义机器人 webhook **不支持** file 消息，必须用应用身份先
+        ``im/v1/files`` 上传拿 file_key，再 ``im/v1/messages`` 发到 chat_id。
+        没配 ``FEISHU_CHAT_ID`` 时降级为「文本提示 + 本地路径」，绝不静默丢文件。
+        """
+        path = Path(file_path)
+        if not path.exists():
+            return FeishuSendResult(ok=False, mode=self.mode, error=f"文件不存在: {path}")
+        name = file_name or path.name
+
+        if not self.settings.feishu_live:
+            message_id = f"mock-feishu-group-file-{uuid.uuid4().hex[:16]}"
+            logger.info(
+                "feishu.mock.send_group_file",
+                extra=log_extra(file=name, bytes=path.stat().st_size),
+            )
+            return FeishuSendResult(ok=True, mode="mock", message_id=message_id)
+
+        chat_id = (self.settings.feishu_chat_id or "").strip()
+        if not chat_id:
+            await self.send_group_text(
+                f"（简历压缩包已生成，但未配置 FEISHU_CHAT_ID，无法上传到群）{name}"
+            )
+            return FeishuSendResult(
+                ok=False,
+                mode="live",
+                error="自定义机器人 webhook 不支持文件消息，且未配置 FEISHU_CHAT_ID",
+            )
+
+        def _call() -> Any:
+            from lark_oapi.api.im.v1 import (
+                CreateFileRequest,
+                CreateFileRequestBody,
+                CreateMessageRequest,
+                CreateMessageRequestBody,
+            )
+
+            with path.open("rb") as handle:
+                upload_request = (
+                    CreateFileRequest.builder()
+                    .request_body(
+                        CreateFileRequestBody.builder()
+                        .file_type("stream")
+                        .file_name(name)
+                        .file(handle)
+                        .build()
+                    )
+                    .build()
+                )
+                upload_response = self._sdk().im.v1.file.create(upload_request)
+            if not upload_response.success():
+                raise ExternalServiceError(
+                    f"飞书文件上传失败 code={upload_response.code} msg={upload_response.msg}"
+                )
+            file_key = upload_response.data.file_key
+            request = (
+                CreateMessageRequest.builder()
+                .receive_id_type("chat_id")
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("file")
+                    .content(json.dumps({"file_key": file_key}))
+                    .build()
+                )
+                .build()
+            )
+            return self._sdk().im.v1.message.create(request)
+
+        try:
+            response = await asyncio.to_thread(_call)
+            if not response.success():
+                error = f"code={response.code} msg={response.msg}"
+                logger.warning("feishu.send_group_file.rejected", extra=log_extra(error=error))
+                await self._notify_file_failed(name, error)
+                return FeishuSendResult(ok=False, mode="live", error=error)
+            return FeishuSendResult(
+                ok=True, mode="live", message_id=getattr(response.data, "message_id", "") or ""
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("feishu.send_group_file.failed", extra=log_extra(error=str(exc)))
+            await self._notify_file_failed(name, str(exc))
+            return FeishuSendResult(ok=False, mode="live", error=str(exc))
+
+    async def _notify_file_failed(self, file_name: str, error: str) -> None:
+        """文件没能进群时，在群里说一句人话，别让 HR 以为简历包发了。
+
+        最常见的失败是应用没开 ``im:resource:upload``（飞书返回 99991672）。
+        这时群里至少要有「压缩包已生成在哪、要开哪个权限」这两条信息。
+        """
+        try:
+            await self.send_group_text(
+                f"⚠️ 简历压缩包「{file_name}」没能上传到群：{error[:200]}\n"
+                "（压缩包已生成在服务器 var/packages 目录；若是权限问题，请为应用开通 "
+                "im:resource:upload 后重试）"
+            )
+        except Exception as exc:  # noqa: BLE001 - 通知失败不能再抛，避免覆盖原始错误
+            logger.warning("feishu.file_failed_notice.failed", extra=log_extra(error=str(exc)))
+
+    async def _post_webhook(self, payload: dict[str, Any], *, kind: str) -> FeishuSendResult:
+        """POST 到群机器人 webhook 并归一化返回。
+
+        飞书的成功响应有两种形状：``{"code": 0, "msg": "success"}``
+        （新接口）与 ``{"StatusCode": 0, "StatusMessage": "success"}``（老接口），
+        两个都要认，否则会把成功判成失败并触发补发，导致群里收到重复消息。
+        """
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(self.settings.feishu_webhook_url, json=payload)
+            data = response.json() if response.content else {}
+        except Exception as exc:  # noqa: BLE001 - 网络异常统一收口
+            logger.warning("feishu.webhook.failed", extra=log_extra(kind=kind, error=str(exc)))
+            return FeishuSendResult(ok=False, mode="live", error=str(exc))
+
+        code = data.get("code", data.get("StatusCode"))
+        if response.status_code // 100 == 2 and code in (0, None):
+            message_id = f"group-{uuid.uuid4().hex[:12]}"
+            logger.info("feishu.webhook.sent", extra=log_extra(kind=kind, message_id=message_id))
+            return FeishuSendResult(ok=True, mode="live", message_id=message_id)
+        error = f"code={code} msg={data.get('msg') or data.get('StatusMessage')}"
+        logger.warning("feishu.webhook.rejected", extra=log_extra(kind=kind, error=error))
+        return FeishuSendResult(ok=False, mode="live", error=error)
+
     # ------------------------------------------------------------ 出站：文本
     async def send_text(self, open_id: str, text: str) -> FeishuSendResult:
         """给主管发纯文本消息（不阻塞事件循环：SDK 同步调用放到线程池）。"""

@@ -119,27 +119,51 @@ def _first_sentence(text: str, keyword: str) -> str:
 
 
 def _merge_resume(rule: ExtractedCandidate, llm: ExtractedCandidate) -> ExtractedCandidate:
-    def pick(field: str):
+    """合并「规则抽取」与「大模型抽取」，按字段性质决定谁优先。
+
+    2026-11-12 调整（原实现是模型全覆盖规则，模型写错姓名/邮箱就直接错）：
+
+    * **基础字段**（姓名/邮箱/电话/学历/院校/专业）→ **规则优先**。这些格式固定，
+      正则与词典校验比模型可靠；模型只在规则抽空时补位。
+    * **年限** → **规则优先**。规则用的是「工作时间区间并集」，比模型读文字描述准；
+      原实现取 ``max(rule, llm)``，模型虚报年限会让硬条件误放行。
+    * **复杂字段**（技能/项目亮点/摘要/岗位意向）→ **模型优先**，规则兜底。
+      「我负责写代码」这类表述只有模型能归纳成「后端开发」。
+    """
+
+    def rule_first(field: str):
+        rule_value = getattr(rule, field)
+        llm_value = getattr(llm, field)
+        if isinstance(rule_value, str):
+            return rule_value.strip() or (llm_value or "")
+        return rule_value if rule_value else llm_value
+
+    def llm_first(field: str):
         llm_value = getattr(llm, field)
         rule_value = getattr(rule, field)
         if isinstance(llm_value, str):
-            return llm_value.strip() or rule_value
+            return llm_value.strip() or (rule_value or "")
         return llm_value if llm_value else rule_value
 
+    # 年限：规则抽到就用规则的；规则为 0（确实是应届/没写区间）才信模型
+    rule_years = float(rule.years_experience or 0)
+    years = rule_years if rule_years > 0 else float(llm.years_experience or 0)
+
+    # 技能：模型先（保留更自然的表述与同义词），规则命中的词补在后面，顺序去重
     skills = list(dict.fromkeys([*(llm.skills or []), *(rule.skills or [])]))
-    highlights = llm.project_highlights or rule.project_highlights
+
     return ExtractedCandidate(
-        name=pick("name"),
-        email=pick("email"),
-        phone=pick("phone"),
-        education_level=pick("education_level"),
-        school=pick("school"),
-        major=pick("major"),
-        years_experience=max(float(llm.years_experience or 0), float(rule.years_experience or 0)),
+        name=rule_first("name"),
+        email=rule_first("email"),
+        phone=rule_first("phone"),
+        education_level=rule_first("education_level"),
+        school=rule_first("school"),
+        major=rule_first("major"),
+        years_experience=years,
         skills=skills,
-        project_highlights=highlights,
-        summary=pick("summary"),
-        position_hint=pick("position_hint"),
+        project_highlights=llm_first("project_highlights"),
+        summary=llm_first("summary"),
+        position_hint=llm_first("position_hint"),
         confidence=max(llm.confidence, rule.confidence),
         source_quotes=llm.source_quotes or rule.source_quotes,
     )

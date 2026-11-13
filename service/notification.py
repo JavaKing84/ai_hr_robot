@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from client.feishu import FeishuClient
@@ -43,6 +44,8 @@ class NoticeResult:
     ok: bool
     message_id: str = ""
     detail: str = ""
+    # True = 只生成了草稿并挂起，实际没有投递（等人工确认）
+    pending: bool = False
 
 
 class NotificationService:
@@ -143,9 +146,9 @@ class NotificationService:
             company_name=self.company.name,
         )
 
-        feishu_text = await self.feishu.send_text(position.supervisor_open_id, summary_text)
+        feishu_text = await self.feishu.push_text(position.supervisor_open_id, summary_text)
         await self._record_feishu_out(
-            recipient=position.supervisor_open_id,
+            recipient=self._feishu_recipient(position.supervisor_open_id),
             body=summary_text,
             message_id=feishu_text.message_id,
             ok=feishu_text.ok,
@@ -154,11 +157,11 @@ class NotificationService:
             parsed={"kind": "resume_package_notice", "passed_count": len(candidates)},
         )
 
-        file_result = await self.feishu.send_file(
+        file_result = await self.feishu.push_file(
             position.supervisor_open_id, package_path, file_name=package_name
         )
         await self._record_feishu_out(
-            recipient=position.supervisor_open_id,
+            recipient=self._feishu_recipient(position.supervisor_open_id),
             body=f"[简历压缩包] {package_name}",
             message_id=file_result.message_id,
             ok=file_result.ok,
@@ -242,6 +245,7 @@ class NotificationService:
                     "project_highlights": "；".join(c.project_highlights or []) or "—",
                     "hit_detail": (c.score_detail or {}).get("reason", ""),
                     "resume_filename": c.resume_filename,
+                    **_deep_fields(c),
                 }
                 for c in candidates
             ],
@@ -338,7 +342,14 @@ class NotificationService:
         location: str | None = None,
         notes: str = "",
         message_id: str | None = None,
+        confirmed: bool = False,
     ) -> NoticeResult:
+        """发送单封面试通知。
+
+        ``confirmed=False``（默认）时受 ``interview_notice_require_confirm`` 管控：
+        只生成草稿并挂起为 ``pending_approval``，绝不投递；只有 HR 走
+        ``confirm_pending_interview_notices()`` 显式确认后才会真正发出。
+        """
         if not candidate.email:
             return NoticeResult(ok=False, detail="候选人缺邮箱，无法发送面试通知")
 
@@ -371,6 +382,19 @@ class NotificationService:
                 extra=log_extra(candidate_id=candidate.id, message_id=message_id),
             )
             return NoticeResult(ok=True, message_id=message_id, detail="已发送过，幂等跳过")
+
+        # 人工确认闸门（测试期默认开启）：只挂起草稿，不调用 SMTP
+        if self.settings.interview_notice_require_confirm and not confirmed:
+            return await self._park_interview_notice(
+                candidate,
+                position,
+                subject=subject,
+                body=body,
+                interview_time=interview_time,
+                location=place,
+                message_id=message_id,
+                token=token,
+            )
 
         result = await self.mailbox.send(
             to=candidate.email,
@@ -435,6 +459,253 @@ class NotificationService:
             )
         await self.session.commit()
         return NoticeResult(ok=result.ok, message_id=message_id, detail=result.error)
+
+    # ------------------------------------------------- 人工确认闸门（测试期）
+    async def _park_interview_notice(
+        self,
+        candidate: Candidate,
+        position: Position,
+        *,
+        subject: str,
+        body: str,
+        interview_time: datetime,
+        location: str,
+        message_id: str,
+        token: str,
+    ) -> NoticeResult:
+        """把面试通知存成 pending_approval 草稿，等 HR 确认后再发。
+
+        不动 smtp、不写「已发送」，候选人状态停在 INTERVIEW_PENDING_CONFIRM。
+        确认入口见 ``confirm_pending_interview_notices()``。
+        """
+        from_state = candidate.status
+        candidate.status = CandidateStatus.INTERVIEW_PENDING_CONFIRM
+        candidate.interview_time = interview_time
+        candidate.interview_location = location
+        await self.session.flush()
+
+        await self._record_email_out(
+            recipient=candidate.email,
+            subject=subject,
+            body=body,
+            message_id=message_id,
+            ok=True,
+            candidate_id=candidate.id,
+            position_id=position.id,
+            thread_key=token,
+            status="pending_approval",
+        )
+        await self.events.record(
+            "interview.notice_pending_approval",
+            actor=Actor.ROBOT,
+            object_type="candidate",
+            object_id=candidate.id,
+            from_state=from_state,
+            to_state=candidate.status,
+            detail={
+                "position_code": position.code,
+                "interview_time": interview_time.isoformat(),
+                "location": location,
+                "message_id": message_id,
+                "recipient": candidate.email,
+                "subject": subject,
+            },
+            note="面试通知已生成草稿，等待 HR 人工确认后发送（未投递）",
+        )
+        await self.session.commit()
+        logger.info(
+            "interview.notice.parked",
+            extra=log_extra(candidate_id=candidate.id, recipient=candidate.email),
+        )
+        return NoticeResult(
+            ok=True,
+            message_id=message_id,
+            detail="已挂起：等待人工确认后发送（未投递）",
+            pending=True,
+        )
+
+    async def pending_interview_notices(self) -> list[Message]:
+        """列出所有待确认的面试通知草稿（按创建顺序）。"""
+        result = await self.session.execute(
+            select(Message)
+            .where(
+                Message.channel == Channel.EMAIL,
+                Message.direction == Direction.OUTBOUND,
+                Message.status == "pending_approval",
+            )
+            .order_by(Message.id)
+        )
+        return list(result.scalars().all())
+
+    async def confirm_pending_interview_notices(
+        self, message_ids: Sequence[int] | None = None
+    ) -> list[NoticeResult]:
+        """HR 确认后，把挂起的面试通知真正发出去。
+
+        ``message_ids`` 为空表示发送全部待确认项；发送成功后原草稿标记 superseded，
+        并沿用原 Message-ID，天然幂等（重复确认不会发第二封）。
+        """
+        pending = await self.pending_interview_notices()
+        if message_ids:
+            wanted = {int(mid) for mid in message_ids}
+            pending = [row for row in pending if row.id in wanted]
+
+        results: list[NoticeResult] = []
+        for record in pending:
+            candidate = (
+                await self.session.get(Candidate, record.candidate_id)
+                if record.candidate_id
+                else None
+            )
+            position = (
+                await self.session.get(Position, record.position_id) if record.position_id else None
+            )
+            if candidate is None or position is None or not candidate.interview_time:
+                logger.warning(
+                    "interview.notice.confirm_skipped",
+                    extra=log_extra(message_id=record.external_id),
+                )
+                continue
+
+            result = await self.send_interview_notice(
+                candidate,
+                position,
+                interview_time=candidate.interview_time,
+                location=candidate.interview_location,
+                message_id=record.external_id,
+                confirmed=True,
+            )
+            record.status = "superseded"
+            await self.session.flush()
+            results.append(result)
+
+        await self.session.commit()
+        return results
+
+    async def request_interview_approval(
+        self,
+        open_id: str,
+        *,
+        supervisor_title: str = "HR",
+    ) -> NoticeResult:
+        """在飞书向 HR 本人发一条「是否确认发送」的请示（不投递任何邮件）。
+
+        只在存在 ``pending_approval`` 草稿时才有意义；HR 回复「确认 / 确认 1,3 / 取消」
+        由 ``FeedbackService._handle_interview_approval()`` 接住并调用
+        ``confirm_pending_interview_notices()`` / ``cancel_pending_interview_notices()``。
+        """
+        pending = await self.pending_interview_notices()
+        if not pending:
+            return NoticeResult(ok=False, detail="当前没有待确认的面试通知")
+
+        items: list[dict[str, object]] = []
+        first_time: datetime | None = None
+        first_location = ""
+        for index, record in enumerate(pending, start=1):
+            candidate = (
+                await self.session.get(Candidate, record.candidate_id) if record.candidate_id else None
+            )
+            position = (
+                await self.session.get(Position, record.position_id) if record.position_id else None
+            )
+            if candidate is not None and first_time is None:
+                first_time = candidate.interview_time
+                first_location = candidate.interview_location or ""
+            score = candidate.score if candidate is not None else None
+            items.append(
+                {
+                    "index": index,
+                    "name": (candidate.name if candidate else "") or "未命名",
+                    "email": (candidate.email if candidate else "") or record.recipient or "（缺邮箱）",
+                    "position_title": position.title if position else "（未归位）",
+                    "score": f"{score:.1f}" if score is not None else "-",
+                }
+            )
+
+        text = self.render(
+            "feishu_approval_request.md",
+            supervisor_title=supervisor_title or "HR",
+            count=len(items),
+            items=items,
+            interview_time=(
+                format_interview_time(first_time, self.settings.timezone) if first_time else "待定"
+            ),
+            location=first_location or self.mailbox_config.interview_location or "地点待定",
+            company_name=self.company.name,
+        )
+        result = await self.feishu.push_text(open_id, text)
+        await self._record_feishu_out(
+            recipient=self._feishu_recipient(open_id),
+            body=text,
+            message_id=result.message_id,
+            ok=result.ok,
+            error=result.error,
+            parsed={
+                "kind": "interview_approval_request",
+                "pending_ids": [row.id for row in pending],
+            },
+        )
+        await self.events.record(
+            "interview.approval_requested",
+            actor=Actor.ROBOT,
+            object_type="message",
+            object_id=None,
+            detail={
+                "open_id": open_id,
+                "pending_count": len(items),
+                "pending_ids": [row.id for row in pending],
+                "feishu_ok": result.ok,
+                "feishu_error": result.error,
+            },
+            note=f"已通过飞书向 HR 请示：{len(items)} 份面试通知待确认，暂未投递",
+        )
+        await self.session.commit()
+        logger.info(
+            "interview.approval.requested",
+            extra=log_extra(open_id=open_id, pending=len(items), ok=result.ok),
+        )
+        return NoticeResult(ok=result.ok, message_id=result.message_id, detail=result.error)
+
+    async def cancel_pending_interview_notices(
+        self, message_ids: Sequence[int] | None = None
+    ) -> int:
+        """HR 在飞书回复「取消」：把挂起的草稿作废，候选人退回已分发状态。"""
+        pending = await self.pending_interview_notices()
+        if message_ids:
+            wanted = {int(mid) for mid in message_ids}
+            pending = [row for row in pending if row.id in wanted]
+
+        cancelled = 0
+        for record in pending:
+            candidate = (
+                await self.session.get(Candidate, record.candidate_id)
+                if record.candidate_id
+                else None
+            )
+            from_state = candidate.status if candidate is not None else None
+            if candidate is not None and candidate.status == CandidateStatus.INTERVIEW_PENDING_CONFIRM:
+                candidate.status = CandidateStatus.DISPATCHED
+                candidate.interview_time = None
+                candidate.interview_location = ""
+            record.status = "cancelled"
+            await self.events.record(
+                "interview.notice_cancelled",
+                actor=Actor.HR,
+                object_type="candidate",
+                object_id=record.candidate_id,
+                from_state=from_state,
+                to_state=candidate.status if candidate is not None else None,
+                detail={
+                    "message_id": record.external_id,
+                    "recipient": record.recipient,
+                    "subject": record.subject,
+                },
+                note="HR 在飞书回复取消，面试通知作废且未投递",
+            )
+            cancelled += 1
+
+        await self.session.commit()
+        return cancelled
 
     async def send_interview_notices(
         self,
@@ -523,7 +794,7 @@ class NotificationService:
             )
             if delivered is not None:
                 continue
-            result = await self.feishu.send_text(record.recipient, record.body)
+            result = await self.feishu.push_text(record.recipient, record.body)
             await self._record_feishu_out(
                 recipient=record.recipient,
                 body=record.body,
@@ -645,9 +916,9 @@ class NotificationService:
         thread_key: str = "",
         kind: str = "generic",
     ) -> NoticeResult:
-        result = await self.feishu.send_text(open_id, text)
+        result = await self.feishu.push_text(open_id, text)
         await self._record_feishu_out(
-            recipient=open_id,
+            recipient=self._feishu_recipient(open_id),
             body=text,
             message_id=result.message_id,
             ok=result.ok,
@@ -659,6 +930,10 @@ class NotificationService:
         )
         await self.session.commit()
         return NoticeResult(ok=result.ok, message_id=result.message_id, detail=result.error)
+
+    def _feishu_recipient(self, open_id: str) -> str:
+        """留痕里的收件人：群模式下记 feishu-group，避免把「群」写成某个人的 open_id。"""
+        return "feishu-group" if self.settings.feishu_group_push else open_id
 
     async def send_receipt_to_supervisor(
         self,
@@ -779,6 +1054,7 @@ class NotificationService:
         candidate_id: int | None = None,
         position_id: int | None = None,
         thread_key: str = "",
+        status: str | None = None,
     ) -> None:
         await self.messages.add(
             Message(
@@ -792,7 +1068,8 @@ class NotificationService:
                 thread_key=thread_key,
                 candidate_id=candidate_id,
                 position_id=position_id,
-                status=("sent" if ok and self.settings.mail_live else "mocked") if ok else "failed",
+                status=status
+                or (("sent" if ok and self.settings.mail_live else "mocked") if ok else "failed"),
                 error=error,
                 sent_at=now_utc_naive(),
             )
@@ -806,6 +1083,28 @@ def _fmt_years(value: float | None) -> str:
     if value is None:
         return "0"
     return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
+def _deep_fields(candidate: Candidate) -> dict[str, str]:
+    """把大模型深度解析压成摘要模板用的三行文本（没有就留空，模板自动跳过）。"""
+    deep = (candidate.score_detail or {}).get("deep_analysis") or {}
+    if not isinstance(deep, dict) or not deep:
+        return {"deep_line": "", "risks": "", "interview_focus": ""}
+
+    labels = deep.get("dimension_labels") or {}
+    dims = deep.get("dimensions") or {}
+    parts = []
+    for key, score in dims.items():
+        label = labels.get(key) or key
+        parts.append(f"{label} {score:g}")
+    line = "｜".join(parts)
+    if deep.get("strengths"):
+        line += f"；亮点：{'、'.join(deep['strengths'][:2])}"
+    return {
+        "deep_line": line,
+        "risks": "、".join(deep.get("risks") or []),
+        "interview_focus": "、".join(deep.get("interview_focus") or []),
+    }
 
 
 def markdown_to_html(text: str) -> str:

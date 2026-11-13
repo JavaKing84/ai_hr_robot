@@ -8,7 +8,7 @@ echo  AI-HR server starting...
 echo  Keep this window open. Close = stop server.
 echo ============================================
 echo.
-".venv\Scripts\python.exe" -m uvicorn main:app --host 127.0.0.1 --port 8000
+".venv\Scripts\python.exe" -m uvicorn core.main:app --host 127.0.0.1 --port 8000
 echo.
 echo [Server exited] Exit code %ERRORLEVEL%
 pause

@@ -8,6 +8,19 @@
 
 ---
 
+## 1.1 关键能力一览
+
+| 能力 | 说明 | 开关（.env） |
+|---|---|---|
+| 飞书群机器人推送 | 出站消息可走群 webhook，不再逐个 open_id 私信 | `FEISHU_WEBHOOK_URL` + `FEISHU_PUSH_TARGET=group` |
+| 面试通知确认闸门 | 面试通知先挂起，等 HR 回复「确认」才真正发邮件 | `INTERVIEW_NOTICE_REQUIRE_CONFIRM=true` |
+| 多供应商 LLM 降级链 | 主模型失败自动按顺序换下一家，全挂则回落到规则抽取 | `LLM_PROVIDERS`（JSON 数组） |
+| 语义分影子模式 + 深度解析 | 大模型打分落库留痕，但通过与否仍按规则分判定；附带 AI 亮点/风险/追问点 | `SEMANTIC_SHADOW=true`、`LLM_DEEP_ANALYSIS=true` |
+
+> 语义分权重在 `config/positions.yaml` 每个岗位的 `semantic_weight` 字段（0~100，建议 25~35）。
+
+---
+
 ## 2. 架构流程图
 
 ### 2.1 业务闭环：双入口 × 双出口
@@ -119,7 +132,6 @@
 ```
 hr_ai_robot/
 │
-├── main.py                          # 启动入口：造 app + 起 uvicorn，零业务
 ├── README.md                        # 本文件：流程图 + 目录 + 怎么跑
 ├── API.md                           # 所有 HTTP 接口：路由/入参/出参示例
 ├── AGENT.md                         # 边界/环境/配置/纪律/状态机（改代码前必读）
@@ -209,6 +221,7 @@ hr_ai_robot/
 │
 ├── core/                            # 【底座】跟业务无关的公共工具
 │   ├── __init__.py                  # 空包标记
+│   ├── main.py                      # 启动入口：造 app + 起 uvicorn，零业务（原根目录 main.py）
 │   ├── db.py                        # 连库三件套：引擎/会话/基类
 │   ├── deps.py                      # 容器与请求级服务装配
 │   ├── exceptions.py                # 自定义报错 + 错误码
@@ -219,12 +232,14 @@ hr_ai_robot/
 │
 ├── config/                          # 【配置】HR 只改这里，改完下轮生效
 │   ├── __init__.py                  # 空包标记
-│   ├── settings.py                  # 读 .env，给出各种路径
-│   ├── positions.yaml               # 部门/职位/主管/筛选规则
-│   └── templates/                   # 六份出站文案（Jinja2）
+│   ├── settings.py                  # 读 .env，给出各种路径与开关
+│   ├── positions.yaml               # 部门/职位/主管/筛选规则（含 semantic_weight 语义分权重）
+│   ├── majors.txt                   # 专业词库（简历专业归一化用）
+│   └── templates/                   # 七份出站文案（Jinja2）
 │       ├── feishu_dispatch.md       # 给主管的简历包摘要
-│       ├── resume_package_summary.md # zip 里的 00-筛选说明
+│       ├── resume_package_summary.md # zip 里的 00-筛选说明（含 AI 深度解析）
 │       ├── feishu_receipt.md        # 「已通知 N 人」回执
+│       ├── feishu_approval_request.md # 面试通知「待 HR 确认」审批请求
 │       ├── interview_notice.md      # 面试通知邮件
 │       ├── interview_update.md      # 改期确认邮件
 │       └── feishu_candidate_reply.md # 候选人回信的飞书汇报
@@ -239,19 +254,31 @@ hr_ai_robot/
 │   ├── feishu_ws_bridge.py          # 飞书长连接转本地 webhook
 │   ├── eval_extraction.py           # 抽取准确率评估
 │   ├── test_idempotency_demo.py     # 手动验证重复投递只留 1 条
-│   └── migrate_sqlite_to_pg.py      # SQLite 旧库整表搬到 PostgreSQL
+│   ├── migrate_sqlite_to_pg.py      # SQLite 旧库整表搬到 PostgreSQL
+│   ├── run_cycle_once.py            # 手动跑一轮闭环（不起服务）
+│   ├── check_mail_login.py          # 检查邮箱 IMAP 登录是否正常
+│   ├── interview_notices.py         # 查看/确认待发的面试通知
+│   ├── e2e_four_chains.py           # 四条链路端到端自检
+│   ├── probe_llm.py                 # 探测 LLM 供应商可用性
+│   └── ab_semantic.py               # 语义分对照实验
 │
 ├── tests/                           # 【测试】全程离线、确定性
 │   ├── __init__.py                  # 空包标记
-│   ├── conftest.py                  # 夹具：临时库 + 应用 + HTTP 客户端
+│   ├── conftest.py                  # 夹具：临时库 + 应用 + HTTP 客户端（测试用 fixtures/positions.test.yaml）
+│   ├── fixtures/
+│   │   └── positions.test.yaml      # 测试专用岗位配置（与线上 open_id 解耦）
 │   ├── test_workflow.py             # 端到端：收→筛→发→回→通知→改期
 │   ├── test_screening.py            # 硬性淘汰、加权打分、阈值
+│   ├── test_semantic_scoring.py     # 语义分 + 深度解析
 │   ├── test_extraction.py           # 抽取、降级、姓名接地
 │   ├── test_extraction_eval.py      # 抽取评估只锁硬不变量
 │   ├── test_ingestion.py            # 归位失败降级入库且不中断
 │   ├── test_email_threading.py      # 邮件线程匹配与兜底
 │   ├── test_timeparse.py            # 中文时间解析
 │   ├── test_feishu_events.py        # 飞书事件归一化
+│   ├── test_feishu_group_push.py    # 飞书群机器人推送
+│   ├── test_interview_confirm_gate.py # 面试通知确认闸门
+│   ├── test_llm_providers.py        # 多供应商 LLM 降级链
 │   ├── test_scheduler.py            # 定时任务注册与触发规则
 │   ├── test_safe_process.py         # 解析器崩溃主进程仍活着
 │   ├── test_stability.py            # 幂等、补发、异常隔离
@@ -262,26 +289,33 @@ hr_ai_robot/
 │   │   ├── 初始化数据库.bat         # 双击：建表 + 写入测试公司
 │   │   ├── 启动简历测试.bat         # 双击：起服务并占住窗口
 │   │   └── 启动飞书长连接.bat       # 双击：本地免公网收飞书消息
-│   └── testdata/                    # 【测试数据】5 份演示简历（含真实姓名，已 gitignore）
+│   └── testdata/                    # 【测试数据】演示简历（含真实姓名，已 gitignore）
 │       ├── 使用说明.md
-│       ├── 01_陈昊然_高级后端工程师_通过.txt
-│       ├── 02_林思远_后端开发工程师_通过.txt
-│       ├── 03_赵语彤_算法工程师_通过.txt
-│       ├── 04_周文彬_后端开发工程师_不通过.txt
-│       ├── 05_许佳宁_后端开发工程师_不通过.txt
+│       ├── 技术部/                  # 高级后端 + 算法 + Python开发 的简历
+│       ├── 产品部/                  # 产品经理简历
+│       ├── 市场部/                  # 市场运营专员简历
 │       └── 格式样本/                # 同一份简历的 docx/pdf/txt
 │
 ├── docs/                            # 【补充文档】按需查阅
-│   ├── architecture.md              # 架构与各阶段时序图
-│   ├── database-setup.md            # PostgreSQL 配置与旧库迁移
-│   ├── llm-setup.md                 # LLM 接入与降级顺序
-│   ├── unattended-protocol.md       # 无人值守部署与故障处置
-│   ├── testing-report.md            # 测试覆盖报告
-│   ├── known-limitations.md         # 已知限制与修复记录
-│   ├── pdf-isolation-plan.md        # 损坏 PDF 隔离方案（演进方向）
-│   ├── innovation-statement.md      # 创新点与借鉴清单
-│   ├── OPTIMIZATION-NOTES.md        # 优化记录（验收后归档）
-│   └── 最简测试指南.md              # 用真邮箱 + 真飞书实测一遍的手册
+│   ├── README.md                    # 文档总索引
+│   ├── API.md                       # 接口文档
+│   ├── DECISIONS.md                 # 设计决策台账
+│   ├── design/                      # 架构设计类
+│   │   ├── architecture.md          # 架构与各阶段时序图
+│   │   └── innovation-statement.md  # 创新点与借鉴清单
+│   ├── ops/                         # 运维部署类
+│   │   ├── database-setup.md        # PostgreSQL 配置与旧库迁移
+│   │   ├── llm-setup.md             # LLM 接入与降级顺序
+│   │   └── unattended-protocol.md   # 无人值守部署与故障处置
+│   ├── quality/                     # 质量与限制类
+│   │   ├── testing-report.md        # 测试覆盖报告
+│   │   ├── known-limitations.md     # 已知限制与修复记录
+│   │   ├── pdf-isolation-plan.md    # 损坏 PDF 隔离方案（演进方向）
+│   │   └── Bug修复说明_20261112.md   # Boss 简历解析故障修复记录
+│   ├── guide/                       # 使用指南类
+│   │   └── 最简测试指南.md          # 用真邮箱 + 真飞书实测一遍的手册
+│   └── archive/                     # 归档
+│       └── OPTIMIZATION-NOTES.md    # 优化记录（验收后归档）
 │
 └── var/                             # 【运行时，已 gitignore】产物都在这
     ├── hr.db                        # 本地 SQLite 库（.env 里指到这）
@@ -331,14 +365,14 @@ SCHEDULE_CRON=0 9 * * *
 ```
 
 ```bat
-:: 5) 建表 + 写入测试公司（3 部门 / 3 主管 / 4 职位）
+:: 5) 建表 + 写入测试公司（3 部门 / 3 主管 / 5 职位）
 python scripts\seed.py --reset
 
 :: 6) 一条命令看完整个闭环（打印机器人真正发出的飞书文本和邮件正文）
 python scripts\demo.py --verbose
 
 :: 7) 起服务（另开一个窗口；或双击「启动简历测试.bat」）
-python main.py
+python -m uvicorn core.main:app --host 127.0.0.1 --port 8000
 
 :: 8) 手动触发一轮
 curl -X POST http://127.0.0.1:8000/api/v1/recruitment/run
@@ -382,7 +416,7 @@ python scripts/seed.py --reset
 python scripts/demo.py --verbose
 
 # 7) 起服务
-python main.py
+python -m uvicorn core.main:app --host 127.0.0.1 --port 8000
 ```
 
 ```bash

@@ -22,7 +22,8 @@ docs/
 ├── quality/                   # 质量与测试
 │   ├── testing-report.md      # 测试覆盖报告
 │   ├── known-limitations.md   # 已知限制与修复记录
-│   └── pdf-isolation-plan.md  # 损坏 PDF 隔离方案（演进方向）
+│   ├── pdf-isolation-plan.md  # 损坏 PDF 隔离方案（演进方向）
+│   └── Bug修复说明_20261112.md # Boss 简历解析故障修复记录
 │
 ├── guide/                     # 操作指南
 │   └── 最简测试指南.md         # 用真邮箱 + 真飞书实测一遍的手册

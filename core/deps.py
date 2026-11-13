@@ -125,7 +125,9 @@ def build_services(session: AsyncSession, container: Container | None = None) ->
     llm = container.llm
 
     extraction = ExtractionService(settings, llm=llm, parser=container.parser)
-    screening = ScreeningService(session, llm=llm, company_name=company.company.name)
+    screening = ScreeningService(
+        session, llm=llm, company_name=company.company.name, settings=settings
+    )
     notification = NotificationService(
         session,
         settings=settings,

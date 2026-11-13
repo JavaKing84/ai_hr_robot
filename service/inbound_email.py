@@ -1,10 +1,15 @@
 """入站邮件处理：一次轮询、三类分流。
 
 分流规则（保证「收简历」与「处理回复」不会互相吞掉对方的邮件）：
+0. 带简历附件 → 一律视为「新简历投递」，跳过按发件人认人的兜底（见下）
 1. 命中线程 / 发件人是候选人 → 候选人回信（改期、放弃、确认）
 2. 命中线程 / 发件人是主管 → 主管反馈（走 ``service/feedback.py``，与飞书同一条代码路径）
 3. 未命中且带简历附件（或正文像简历）→ 交给 ``service/ingestion.py`` 入库
 4. 其他 → 记一条 inbound 消息 + 事件，忽略
+
+规则 0 是 2026-11-12 补的：招聘平台所有通知邮件共用一个 noreply 发件人
+（如 BOSS直聘 ``cv@notice.zhipin.com``），如果按发件人去认候选人，第一封之后
+每一封新简历都会被当成同一位候选人的回信，附件根本不入库。
 """
 
 from __future__ import annotations
@@ -27,7 +32,12 @@ from repository.message import MessageRepository
 from schema.candidate import EmailPollResponse
 from schema.config import MailboxConfig
 from schema.message import InboundMessage
-from service.email_threading import EmailThreadService, ThreadMatch
+from service.email_threading import (
+    RESUME_ATTACHMENT_SUFFIXES,
+    EmailThreadService,
+    ThreadMatch,
+    has_resume_attachment,
+)
 from service.extraction import ExtractionService
 from service.feedback import FeedbackService
 from service.ingestion import IngestionService
@@ -35,7 +45,8 @@ from service.notification import NotificationService
 
 logger = get_logger(__name__)
 
-_RESUME_SUFFIXES = (".pdf", ".doc", ".docx", ".txt", ".md")
+# 与线程判定共用同一份后缀白名单，避免「这封算不算简历」在两层出现口径分歧。
+_RESUME_SUFFIXES = RESUME_ATTACHMENT_SUFFIXES
 _RESUME_HINTS = ("简历", "应聘", "求职", "教育背景", "工作经历", "项目经验")
 
 
@@ -97,11 +108,14 @@ class InboundEmailService:
     # ------------------------------------------------------------------ 分流
     async def handle_email(self, email: InboundEmail, *, cycle_id: int | None = None) -> InboundOutcome:
         match = await self.threads.match(email)
+        # 双保险：即使线程匹配命中了主管/候选人，带简历附件的邮件也优先入库。
+        # 真正需要按「回信」处理的邮件几乎不会带简历附件，且会带 In-Reply-To。
+        resume_attached = has_resume_attachment(email)
 
-        if match.role == "candidate" and match.candidate is not None:
+        if match.role == "candidate" and match.candidate is not None and not resume_attached:
             return await self._handle_candidate_reply(email, match)
 
-        if match.role == "supervisor":
+        if match.role == "supervisor" and not resume_attached:
             inbound = InboundMessage(
                 channel="email",
                 sender_id=email.from_address,

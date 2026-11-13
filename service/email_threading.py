@@ -6,6 +6,13 @@
 3. 发件人是某位主管 → 其最近的简历包线程
 4. 发件人是某位候选人 → 其面试通知线程
 5. 都匹配不上 → unknown，交给人工/日志
+
+**带简历附件的例外**：步骤 3/4 的「按发件人认人」对招聘平台不成立。
+BOSS直聘（``cv@notice.zhipin.com``）、51job（``noreply@...``）等平台给所有候选人
+共用同一个通知发件人；一旦某位候选人被写上了这个地址，之后每一封新简历都会被
+当成「这位候选人的回信」，附件简历全部丢失（2026-11-12 实测：20 封平台邮件里有
+9 封被判成 ``candidate.reply.confirm``）。因此带简历附件的邮件跳过 3/4，
+交给 ``service/inbound_email.py`` 按新简历入库。
 """
 
 from __future__ import annotations
@@ -29,6 +36,42 @@ logger = get_logger(__name__)
 
 _REPLY_TOKEN_RE = re.compile(r"reply\+([A-Za-z0-9._-]+)@", re.IGNORECASE)
 
+#: 简历附件后缀。放在这里作为单一数据源：``service/inbound_email.py`` 直接引用，
+#: 避免「线程判定」和「入库判定」各维护一份白名单导致口径不一致。
+RESUME_ATTACHMENT_SUFFIXES = (".pdf", ".doc", ".docx", ".txt", ".md")
+
+#: 招聘平台 / 邮件系统通知地址的特征。这类地址是「渠道」不是「人」，
+#: 不能拿来认主管或候选人（``cv@notice.zhipin.com``、``noreply@ehire.51job.com`` 等）。
+PLATFORM_SENDER_MARKERS = (
+    "noreply", "no-reply", "donotreply", "do-not-reply", "notice", "notification",
+    "mailer-daemon", "bounce", "robot", "system", "cv@", "resume@", "job@", "hr-notice",
+)
+
+
+def is_platform_sender(address: str) -> bool:
+    """判断发件地址是不是招聘平台 / 邮件系统的共享通知地址。
+
+    只做轻量字符串匹配，宁可漏判也不要误杀真实联系方式：漏判只是多存一个地址，
+    误杀会让候选人失去联系方式。``service/ingestion.py`` 也复用这个函数，
+    避免写进 ``candidates.email`` 造成去重口径污染。
+    """
+    value = (address or "").strip().lower()
+    return bool(value) and any(marker in value for marker in PLATFORM_SENDER_MARKERS)
+
+
+def has_resume_attachment(email: InboundEmail) -> bool:
+    """判断这封入站邮件是否带简历附件（只看后缀，不看主题/正文）。
+
+    用途：招聘平台的通知邮件是「新简历投递」而不是「对已有线程的回复」，
+    不能拿它那个共享的 noreply 发件人去数据库里认主管或候选人。
+    只要带一个简历类附件就返回 True；真正的面试回信几乎不带附件，
+    且带 ``In-Reply-To`` / ``References``，仍由前面的线程匹配正常处理。
+    """
+    return any(
+        (attachment.filename or "").lower().endswith(RESUME_ATTACHMENT_SUFFIXES)
+        for attachment in (email.attachments or [])
+    )
+
 
 @dataclass
 class ThreadMatch:
@@ -47,6 +90,12 @@ class EmailThreadService:
         self.threads = EmailThreadRepository(session)
 
     async def match(self, email: InboundEmail) -> ThreadMatch:
+        # 带简历附件 = 一次新的投递。平台通知发件人是共享的，不能作为身份依据，
+        # 否则「第一位候选人」会把后面所有人的简历都吞成自己的回信。
+        # 注意：上面基于 In-Reply-To / References / reply+token 的线程匹配仍然有效，
+        # 只有「按发件人邮箱猜身份」这两个兜底被禁用。
+        skip_sender_fallback = has_resume_attachment(email)
+
         thread, reason = await self._locate_thread(email)
         if thread is not None:
             if thread.kind == ThreadKind.RESUME_PACKAGE:
@@ -77,6 +126,18 @@ class EmailThreadService:
                 position=position,
                 reason=reason,
             )
+
+        if skip_sender_fallback:
+            logger.info(
+                "thread.skip_sender_fallback",
+                extra=log_extra(sender=email.from_address, subject=email.subject),
+            )
+            return ThreadMatch(role="unknown", reason="带简历附件，按新简历投递处理，不走发件人身份兜底")
+
+        # 平台通知地址也不作为身份依据：它没有附件时同样不该被认成某位候选人的回信，
+        # 否则会不断产生 candidate.reply.* 噪声事件，把真正的反馈淹没。
+        if is_platform_sender(email.from_address):
+            return ThreadMatch(role="unknown", reason="平台通知发件人，不作为主管/候选人身份依据")
 
         # 兜底 3：发件人是主管
         supervisor = await self._find_supervisor(email.from_address)
@@ -170,4 +231,12 @@ def extract_reply_token(addresses: list[str]) -> str:
     return ""
 
 
-__all__ = ["EmailThreadService", "ThreadMatch", "extract_reply_token"]
+__all__ = [
+    "EmailThreadService",
+    "ThreadMatch",
+    "extract_reply_token",
+    "has_resume_attachment",
+    "is_platform_sender",
+    "RESUME_ATTACHMENT_SUFFIXES",
+    "PLATFORM_SENDER_MARKERS",
+]

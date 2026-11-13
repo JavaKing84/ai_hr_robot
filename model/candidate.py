@@ -27,6 +27,7 @@ class CandidateStatus:
     DISPATCHED = "dispatched"                  # 已发主管
     SUPERVISOR_FEEDBACK = "supervisor_feedback"  # 主管已反馈（进入面试名单）
     INTERVIEW_NOTIFIED = "interview_notified"   # 已邮件通知
+    INTERVIEW_PENDING_CONFIRM = "interview_pending_confirm"  # 面试通知已生成，等 HR 确认后发送
     RESCHEDULE_PENDING = "reschedule_pending"   # 改期中（等主管确认）
     DECLINED = "declined"                       # 候选人放弃
     COMPLETED = "completed"                     # 已完成
@@ -39,6 +40,7 @@ class CandidateStatus:
         DISPATCHED,
         SUPERVISOR_FEEDBACK,
         INTERVIEW_NOTIFIED,
+        INTERVIEW_PENDING_CONFIRM,
         RESCHEDULE_PENDING,
         DECLINED,
         COMPLETED,
@@ -52,6 +54,7 @@ class CandidateStatus:
         DISPATCHED: "已发主管",
         SUPERVISOR_FEEDBACK: "主管已反馈",
         INTERVIEW_NOTIFIED: "已邮件通知",
+        INTERVIEW_PENDING_CONFIRM: "面试通知待确认",
         RESCHEDULE_PENDING: "改期中",
         DECLINED: "已放弃",
         COMPLETED: "已完成",

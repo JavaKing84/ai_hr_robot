@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -16,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from client.feishu import FeishuClient
 from client.mailbox import InboundEmail, MailboxClient
-from client.resume_parser import ParsedResume, ResumeParser
+from client.resume_parser import ParsedResume, ResumeParser, normalize_text
 from config.settings import Settings
 from core.logging import get_logger, log_extra
 from core.safe_process import run_in_subprocess
@@ -31,17 +32,34 @@ from repository.message import MessageRepository
 from repository.position import PositionRepository
 from schema.extraction import ExtractedCandidate
 from service.extraction import ExtractionService
+from service.email_threading import RESUME_ATTACHMENT_SUFFIXES, is_platform_sender
 from service.screening import ScreeningService
 from schema.screening import ScreeningResult
 
 logger = get_logger(__name__)
 
-_RESUME_SUFFIXES = (".pdf", ".doc", ".docx", ".txt", ".md")
+# 与线程判定、收件分流共用同一份后缀白名单（单一数据源）。
+_RESUME_SUFFIXES = RESUME_ATTACHMENT_SUFFIXES
 
 #: 单份简历解析的硬超时（秒）。损坏 PDF 可能让解析器卡死，必须有个上限。
 _PARSE_TIMEOUT_SECONDS = 60.0
 #: 解析子进程失败时挂在 ParsedResume.engine 上的标记（用于日志与告警区分）。
 PARSE_FAILED_ENGINE = "subprocess-failed"
+
+#: 平台显示名的特征。``From: BOSS直聘 <cv@notice.zhipin.com>`` 里的名字不是人名。
+_PLATFORM_NAME_MARKERS = (
+    "boss", "直聘", "前程无忧", "51job", "智联", "猎聘", "拉勾", "牛客",
+    "noreply", "招聘平台", "简历投递", "通知", "系统",
+)
+#: 中文人名：2~4 个汉字，用于从平台主题/附件名里兜底取姓名。
+_CN_NAME_RE = re.compile(r"^[\u4e00-\u9fff]{2,4}$")
+#: 平台主题/附件名里常见的方括号块，如「【python开发工程师_北京_11-12K】」。
+_BRACKET_RE = re.compile(r"【[^】]*】|\[[^\[\]]*\]|\([^()]*\)|（[^）]*）")
+#: 这些词即使凑巧是 2~4 个汉字也不是人名。
+_NOT_NAME_MARKERS = (
+    "简历", "应聘", "求职", "工程师", "开发", "招聘", "通知", "岗位",
+    "职位", "先生", "女士", "实习", "测试", "年限", "北京", "上海", "深圳",
+)
 
 
 @dataclass
@@ -127,7 +145,11 @@ class IngestionService:
                 attachment.filename,
                 source="imap",
                 cycle_id=cycle_id,
-                contact_hint={"email": email.from_address, "name": email.from_name},
+                contact_hint={
+                    "email": email.from_address,
+                    "name": email.from_name,
+                    "subject": email.subject,
+                },
             )
             outcomes.append(outcome)
 
@@ -138,7 +160,11 @@ class IngestionService:
                 f"{email.message_id.strip('<>')[:40] or 'email'}.txt",
                 source="imap-body",
                 cycle_id=cycle_id,
-                contact_hint={"email": email.from_address, "name": email.from_name},
+                contact_hint={
+                    "email": email.from_address,
+                    "name": email.from_name,
+                    "subject": email.subject,
+                },
             )
             outcomes.append(outcome)
 
@@ -165,7 +191,10 @@ class IngestionService:
             filename=parsed.filename,
             positions=[(p.code, p.title) for p in active_positions],
         )
-        self._apply_contact_hint(extracted, contact_hint)
+        # 文件名也一并交给兜底逻辑：平台导出的附件名里通常就写着候选人姓名。
+        hint = dict(contact_hint or {})
+        hint.setdefault("filename", filename)
+        self._apply_contact_hint(extracted, hint)
 
         if not active_positions:
             return await self._store_unmatched(
@@ -174,7 +203,12 @@ class IngestionService:
             )
 
         position, match_note = self._resolve_position(
-            parsed.text, extracted, active_positions, explicit_code=position_code
+            parsed.text,
+            extracted,
+            active_positions,
+            explicit_code=position_code,
+            subject=(contact_hint or {}).get("subject", ""),
+            filename=filename,
         )
         if position is None:
             return await self._store_unmatched(
@@ -271,7 +305,9 @@ class IngestionService:
             },
         )
 
-        screening_service = ScreeningService(self.session, llm=self.llm, company_name=self.company_name)
+        screening_service = ScreeningService(
+            self.session, llm=self.llm, company_name=self.company_name, settings=self.settings
+        )
         result = await screening_service.screen_candidate(candidate, position)
         await self.session.commit()
 
@@ -408,7 +444,7 @@ class IngestionService:
             f"⚠️ 收到一份无法自动归位的简历（候选人：{candidate.name or '未知'}），"
             f"请人工介入分配职位。原因：{reason}"
         )
-        result = await self.feishu.send_text(self.hr_alert_open_id, text)
+        result = await self.feishu.push_text(self.hr_alert_open_id, text)
         if not result.ok:
             logger.warning(
                 "ingest.unmatched_alert_failed",
@@ -417,12 +453,35 @@ class IngestionService:
 
     @staticmethod
     def _apply_contact_hint(extracted: ExtractedCandidate, hint: dict[str, str] | None) -> None:
+        """用邮件头补全联系方式，但绝不把「平台通知」当成「候选人本人」。
+
+        平台邮件的 From 形如 ``BOSS直聘 <cv@notice.zhipin.com>``。旧逻辑照单全收，
+        于是候选人变成 ``name=BOSS直聘 / email=cv@notice.zhipin.com``：既污染了去重
+        口径，又让 ``email_threading`` 按发件人把后续每一封新简历认成同一人的回信。
+        现在只在规则抽取为空时补值，且平台地址、平台显示名一律丢弃；姓名改从
+        主题 / 附件名里兜底取（BOSS直聘这两处都写着真实姓名）。
+        """
         if not hint:
             return
-        if not extracted.email and hint.get("email"):
-            extracted.email = hint["email"]
-        if not extracted.name and hint.get("name"):
-            extracted.name = hint["name"]
+
+        sender = (hint.get("email") or "").strip().lower()
+        if not extracted.email and sender and not is_platform_sender(sender):
+            extracted.email = sender
+
+        if not extracted.name:
+            display_name = (hint.get("name") or "").strip()
+            if display_name and not _is_platform_name(display_name):
+                extracted.name = display_name
+            else:
+                extracted.name = _guess_name(
+                    hint.get("subject") or "",
+                    hint.get("filename") or "",
+                )
+
+    @staticmethod
+    def _squash(text: str) -> str:
+        """去掉空白与常见分隔符，用于判断「岗位名是否出现在主题/附件名里」。"""
+        return re.sub(r"[\s\-_—·|｜/\\（）()【】\[\]：:，,、]", "", (text or "").lower())
 
     def _resolve_position(
         self,
@@ -431,7 +490,16 @@ class IngestionService:
         positions: Sequence[Position],
         *,
         explicit_code: str | None = None,
+        subject: str = "",
+        filename: str = "",
     ) -> tuple[Position | None, str]:
+        """归位优先级：指定职位 > 主题/附件名岗位名 > 简历求职意向 > 关键词投票。
+
+        2026-11-12 修：BOSS 的主题「应聘 python开发工程师」、附件名
+        「【python开发工程师_北京_11-12K】谷金玉_4年.pdf」都明写着岗位，
+        旧版只拿正文关键词投票，导致 7 份 Python 简历被「算法工程师」抢走，
+        撞上「硕士 + 九所重点院校」直接淘汰。岗位名比关键词强得多。
+        """
         by_code = {p.code: p for p in positions}
 
         if explicit_code:
@@ -442,13 +510,26 @@ class IngestionService:
                 if position.title == explicit_code:
                     return position, f"指定职位名称 {explicit_code}"
 
+        # 长标题优先，避免「后端工程师」误命中「高级后端工程师」
+        ordered = sorted(positions, key=lambda p: len(p.title or ""), reverse=True)
+
+        name_haystack = self._squash(f"{subject} {filename}")
+        if name_haystack:
+            for position in ordered:
+                title = self._squash(position.title)
+                if title and title in name_haystack:
+                    return position, f"主题/附件名岗位名精确命中「{position.title}」"
+
         hint = (extracted.position_hint or "").strip()
-        if hint:
-            for position in positions:
-                if hint == position.title or hint in position.title or position.title in hint:
+        hint_squashed = self._squash(hint)
+        if hint_squashed:
+            for position in ordered:
+                title = self._squash(position.title)
+                if title and (title in hint_squashed or hint_squashed in title):
                     return position, f"简历注明岗位「{hint}」"
 
-        haystack = f"{resume_text[:4000]} {hint}".lower()
+        # 关键词投票：把主题、附件名、求职意向一起放进 haystack
+        haystack = f"{normalize_text(resume_text)[:4000]} {hint} {subject} {filename}".lower()
         best: tuple[int, Position] | None = None
         for position in positions:
             keywords = [kw for kw in (position.keywords or []) if kw]
@@ -472,7 +553,37 @@ def _looks_like_resume(text: str) -> bool:
     return sum(1 for marker in markers if marker in text) >= 2
 
 
+def _is_platform_name(name: str) -> bool:
+    """判断 From 显示名是不是平台名（而非候选人姓名）。"""
+    value = (name or "").strip().lower()
+    return bool(value) and any(marker in value for marker in _PLATFORM_NAME_MARKERS)
+
+
+def _guess_name(subject: str, filename: str) -> str:
+    """从平台邮件的主题 / 附件名里兜底取中文姓名。
+
+    平台导出的简历文本里常常没有「姓名：」这种字段标签（实测 Boss 那份 PDF 开头是
+    ``'\ue615 性　别： 女 \ue616 工作年限：…'``），正则必然抽空。但主题
+    「谷金玉 | 4年，应聘 python开发工程师 | 北京11-12K【BOSS直聘】」和附件名
+    「【python开发工程师_北京_11-12K】谷金玉_4年.pdf」都带着姓名，
+    比正则和 LLM 更便宜也更准。取不到就返回空串，交给下一层兜底。
+    """
+    for source in (subject, filename):
+        if not source:
+            continue
+        cleaned = _BRACKET_RE.sub(" ", source)
+        for part in re.split(r"[|_，,、\s]+", cleaned):
+            part = part.strip().strip(".")
+            if _CN_NAME_RE.fullmatch(part) and not any(marker in part for marker in _NOT_NAME_MARKERS):
+                return part
+    return ""
+
+
 def _fallback_name(filename: str, email: str) -> str:
+    """姓名最后一层兜底：平台主题/附件名 → 短文件名 → 邮箱前缀 → 占位符。"""
+    guessed = _guess_name("", Path(filename).name)
+    if guessed:
+        return guessed
     stem = Path(filename).stem
     if stem and len(stem) <= 20:
         return stem

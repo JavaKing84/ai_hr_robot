@@ -18,6 +18,9 @@
 - 技能：{{ c.skills }}
 - 项目：{{ c.project_highlights }}
 - 命中明细：{{ c.hit_detail }}
+{% if c.deep_line %}- AI 深度解析：{{ c.deep_line }}{% endif %}
+{% if c.risks %}- 待验证风险：{{ c.risks }}{% endif %}
+{% if c.interview_focus %}- 建议追问：{{ c.interview_focus }}{% endif %}
 - 简历文件：{{ c.resume_filename }}
 
 {% endfor %}

@@ -13,6 +13,13 @@
 
 **任何情况下都不把异常抛给调用方**：降级方式（空文本 / 跳过 / 告警）由 service 层决定，
 本模块只负责「主进程一定活着」。
+
+**结果回传的顺序很重要**：必须先（或同时）消费结果队列，再等子进程退出。
+``multiprocessing.Queue`` 由子进程内的 feeder 线程异步写管道，子进程退出清理时会
+等 feeder 写完；主进程若先 ``process.join(timeout)`` 且一直不读队列，就形成互等——
+子进程等主进程读、主进程等子进程退，最后被误判成「解析超时」并把结果丢掉。
+2026-11-12 实测：一份 8.7MB / 3 页的 Boss 直聘 PDF 直接解析仅 0.94s，
+旧实现却在 20s 后强杀子进程，导致 ``resume_text=0``、候选人姓名兜底成平台名。
 """
 
 from __future__ import annotations
@@ -20,14 +27,19 @@ from __future__ import annotations
 import asyncio
 import inspect
 import multiprocessing
+import time
 from dataclasses import dataclass
 from queue import Empty as QueueEmpty
 from typing import Any, Callable
 
-#: 子进程结果回传等待上限（秒）。仅用于取回已经算完的结果，不是业务超时。
+#: 结果已取回后，允许子进程收尾的最大等待（秒）。
 _RESULT_WAIT_SECONDS = 5.0
 #: terminate 之后的宽限期（秒），超时再 kill。
 _KILL_GRACE_SECONDS = 3.0
+#: 主进程轮询结果队列的间隔（秒）；每次轮询同时检查超时与子进程是否已退出。
+_POLL_INTERVAL_SECONDS = 0.05
+#: 子进程已退出时，留给队列把残留数据刷完的时间（秒）。崩溃场景最多白等这么久。
+_CHILD_EXIT_FLUSH_SECONDS = 0.5
 
 
 @dataclass(frozen=True)
@@ -67,6 +79,21 @@ def _child_entry(func: Callable[..., Any], args: tuple, kwargs: dict, result_que
         result_queue.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
+def _stop_child(process: multiprocessing.Process) -> None:
+    """尽可能让子进程停下来：先 terminate，宽限期内不退再 kill。
+
+    只负责「停」，不负责判断失败原因，也不关闭结果队列；调用方按场景决定
+    返回 ``timed_out`` 还是崩溃文本。
+    """
+    if not process.is_alive():
+        return
+    process.terminate()
+    process.join(_KILL_GRACE_SECONDS)
+    if process.is_alive():  # pragma: no cover - 极端情况下 terminate 也杀不掉
+        process.kill()
+        process.join(_KILL_GRACE_SECONDS)
+
+
 def run_in_subprocess(
     func: Callable[..., Any],
     *args: Any,
@@ -77,6 +104,10 @@ def run_in_subprocess(
 
     ``func`` 需可 pickle（模块级函数或可序列化实例的绑定方法）；返回值同样要可 pickle。
     Windows 上使用 ``spawn``，子进程会重新 import 目标模块——因此 ``func`` 不能是闭包或 lambda。
+
+    等待策略：以 ``timeout`` 为总上限，**持续读取结果队列**，同时观察子进程是否退出。
+    这样既能让大结果顺利回传（避免 feeder 线程与 join 互等），又能在子进程段错误 /
+    OOM 直接消失时快速失败，不必每次崩溃都白等满一个业务超时。
     """
     context = multiprocessing.get_context("spawn")
     result_queue = context.Queue()
@@ -86,14 +117,39 @@ def run_in_subprocess(
         daemon=True,
     )
     process.start()
-    process.join(timeout)
 
-    if process.is_alive():
-        process.terminate()
-        process.join(_KILL_GRACE_SECONDS)
-        if process.is_alive():  # pragma: no cover - 极端情况下 terminate 也杀不掉
-            process.kill()
-            process.join(_KILL_GRACE_SECONDS)
+    payload: tuple[str, Any] | None = None
+    deadline = time.monotonic() + timeout
+    timed_out = False
+
+    # 主进程在这里持续消费队列：子进程 put() 之后才能顺利完成退出清理。
+    # 旧实现是「先 join(timeout) 再 get()」，主进程等待期间无人读管道，
+    # 大结果会卡住子进程的 feeder 线程，最终双双超时并被误杀。
+    while True:
+        try:
+            payload = result_queue.get(timeout=_POLL_INTERVAL_SECONDS)
+        except QueueEmpty:
+            payload = None
+        if payload is not None:
+            break
+
+        # 进程已经结束（正常返回 / 段错误 / OOM）：再给队列一小段时间刷残留数据；
+        # 若确实没有结果，就按崩溃处理，不再空等到 deadline。
+        if not process.is_alive():
+            try:
+                payload = result_queue.get(timeout=_CHILD_EXIT_FLUSH_SECONDS)
+            except QueueEmpty:
+                payload = None
+            break
+
+        if time.monotonic() >= deadline:
+            timed_out = True
+            break
+
+    if timed_out:
+        _stop_child(process)
+        result_queue.close()
+        result_queue.join_thread()
         return SubprocessResult(
             ok=False,
             timed_out=True,
@@ -101,30 +157,30 @@ def run_in_subprocess(
             exitcode=process.exitcode,
         )
 
-    # 子进程正常跑完一定是 exitcode=0；非 0 说明它被信号打死 / os._exit / 内存耗尽，
-    # 此时队列里不可能有结果，不必再等（否则每次崩溃都要白等一个结果超时）。
+    # 结果已经取回；正常情况子进程会立刻退出，但仍设上限防止非 daemon 线程拖住主进程。
+    process.join(_RESULT_WAIT_SECONDS)
+    if process.is_alive():
+        _stop_child(process)
+    result_queue.close()
+    result_queue.join_thread()
+
+    status = payload[0] if payload is not None else ""
+    value = payload[1] if payload is not None else None
+
+    if status == "ok" and process.exitcode in (0, None):
+        return SubprocessResult(ok=True, value=value, exitcode=process.exitcode)
+
+    # 子进程非 0 退出（段错误 / OOM / os._exit）优先报崩溃，队列里即使有半截结果也不采信。
     if process.exitcode not in (0, None):
-        result_queue.close()
-        result_queue.join_thread()
         return SubprocessResult(
             ok=False,
             error="子进程异常退出（疑似解析器崩溃或内存耗尽）",
             exitcode=process.exitcode,
         )
-
-    try:
-        status, payload = result_queue.get(timeout=_RESULT_WAIT_SECONDS)
-    except QueueEmpty:
-        # 子进程没留下结果就没了：段错误 / OOM / 被系统杀掉都是这个形态
-        return SubprocessResult(
-            ok=False,
-            error="子进程未返回结果就退出（疑似解析器崩溃或内存耗尽）",
-            exitcode=process.exitcode,
-        )
-    finally:
-        result_queue.close()
-        result_queue.join_thread()
-
-    if status == "ok":
-        return SubprocessResult(ok=True, value=payload, exitcode=process.exitcode)
-    return SubprocessResult(ok=False, error=str(payload), exitcode=process.exitcode)
+    if status == "error":
+        return SubprocessResult(ok=False, error=str(value), exitcode=process.exitcode)
+    return SubprocessResult(
+        ok=False,
+        error="子进程未返回结果就退出（疑似解析器崩溃或内存耗尽）",
+        exitcode=process.exitcode,
+    )

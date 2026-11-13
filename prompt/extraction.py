@@ -180,7 +180,11 @@ JSON Schema 参考：
 
 # --------------------------------------------------------------------- 语义匹配
 
-SEMANTIC_SYSTEM = "你是招聘筛选助手，只输出 JSON 对象，不要解释。"
+SEMANTIC_SYSTEM = (
+    "你是资深技术招聘官，负责判断简历与岗位 JD 的匹配度。"
+    "只做匹配度评估：不编造简历里没有的经历，不因为岗位描述里出现某个词就假定候选人会。"
+    "严格输出一个 JSON 对象，不要输出任何解释文字或 Markdown 围栏。"
+)
 
 
 def build_semantic_prompt(
@@ -191,23 +195,105 @@ def build_semantic_prompt(
     resume_summary: str,
     skills: list[str],
     project_highlights: list[str],
+    education_level: str = "",
+    school: str = "",
+    major: str = "",
+    years_experience: float = 0.0,
 ) -> str:
-    """与 ``prompt/screening.md`` 第 4 节保持一致的语义打分提示。"""
+    """与 ``prompt/screening.md`` 第 4 节保持一致的语义打分提示。
+
+    除了摘要/技能/项目，还把学历、院校、专业、年限一起给模型——否则它无法判断
+    「JD 要求硕士」这类硬门槛的语义含义，只能靠猜。
+    """
     return f"""你是{company_name}的招聘助理，请判断候选人简历与岗位的匹配程度。
 
 岗位：{position_title}
 岗位描述：{position_description}
 
+候选人背景：
+- 学历：{education_level or '未提供'}
+- 院校：{school or '未提供'}
+- 专业：{major or '未提供'}
+- 工作年限：{years_experience:g} 年
+
 候选人简历摘要：
-{resume_summary}
+{resume_summary or '（未提供摘要）'}
 
 技能：{'、'.join(skills) or '（未提取）'}
 项目：{'；'.join(project_highlights) or '（未提取）'}
 
+评分口径（只看「能力是否对得上 JD」，不看简历写得好不好）：
+- 90-100：核心职责与关键技术栈高度对口，可直接进入面试
+- 70-89：主要能力对口，存在 1-2 项可培养的差距
+- 50-69：部分对口，需要较长上手期
+- 30-49：仅边缘相关，主要靠转岗学习
+- 0-29：明显不对口
+
+要求：
+1. 同义表述要算匹配，例如 JD 要「微服务」而简历写「Spring Cloud / 服务拆分」，应判为匹配；
+2. 只有简历里能找到依据才加分，找不到就按「不具备」处理，禁止脑补；
+3. reason 不超过 60 字，必须点出关键依据（可引用简历原句片段）。
+
 请只输出 JSON：{{"semantic_score": 0-100 的整数, "reason": "不超过 60 字的中文理由"}}
-评分口径：
-- 90-100：经历高度对口，可直接面试
-- 70-89：主要能力对口，有小幅差距
-- 50-69：部分对口，需要培养
-- 0-49：明显不对口
+"""
+
+
+# --------------------------------------------------------------------- 深度解析
+# 2026-11-13 新增：语义分只给一个总分，主管拿到简历包还是得自己看完 12 份才知道
+# 谁值得面。这一层在语义分之上再要四样东西：分维度评分、亮点、风险、面试追问点，
+# 全部要求「有原文依据」，没有依据就留空——宁可少给，不许脑补。
+
+DEEP_ANALYSIS_SYSTEM = (
+    "你是资深技术招聘官，负责对简历做深度评估。"
+    "所有结论必须有简历原文依据；找不到依据的维度一律给 0 并在 basis 里写“简历未体现”。"
+    "只输出一个 JSON 对象，不要任何解释文字或 Markdown 围栏。"
+)
+
+
+def build_deep_prompt(
+    *,
+    company_name: str,
+    position_title: str,
+    position_description: str,
+    resume_text: str,
+    skills: list[str],
+    project_highlights: list[str],
+    education_level: str = "",
+    school: str = "",
+    major: str = "",
+    years_experience: float = 0.0,
+) -> str:
+    return f"""请对下面这份简历做「岗位匹配深度评估」，输出可供 HR 直接决策的结构化结论。
+
+岗位：{position_title}
+岗位描述：{position_description}
+公司：{company_name}
+
+候选人档案：
+- 学历：{education_level or '未提供'}｜院校：{school or '未提供'}｜专业：{major or '未提供'}
+- 工作年限：{years_experience:g} 年
+- 技能：{'、'.join(skills) or '（未提取）'}
+- 项目：{'；'.join(project_highlights) or '（未提取）'}
+
+简历正文（截断）：
+---
+{resume_text[:6000]}
+---
+
+评估要求：
+1. semantic_score：0-100 的岗位匹配总分，口径同「只看能力是否对得上 JD」；
+2. dimensions：四个维度各 0-100，缺依据给 0
+   - skill_match：技术栈/工具与 JD 的重合度
+   - experience_depth：项目复杂度、责任范围、年限含金量
+   - delivery_ability：是否有上线、量化结果、跨团队协作证据
+   - growth_potential：学习曲线、技术广度、可培养性
+3. strengths：最多 3 条，每条不超过 30 字，必须能在简历里找到依据
+4. risks：最多 3 条，例如「无高并发场景」「跳槽频繁」「只做过外包项目」；没有就空数组
+5. interview_focus：最多 3 条，面试时该追问什么来验证风险
+6. reason：不超过 60 字的总评，点出关键依据
+
+请只输出 JSON：
+{{"semantic_score": 0, "dimensions": {{"skill_match": 0, "experience_depth": 0, "delivery_ability": 0, "growth_potential": 0}}, "strengths": [], "risks": [], "interview_focus": [], "reason": ""}}
+注意：上面的 0 与空数组只是字段占位，**必须替换成这份简历的真实评分与真实结论**；
+原样照抄占位符会被判为无效输出，直接降级成「只按规则分」。
 """

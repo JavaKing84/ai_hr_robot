@@ -10,3 +10,5 @@ var/
 .DS_Store
 .idea/
 tests/testdata/
+audit_output/
+.workbuddy/

@@ -23,6 +23,10 @@ from factory.app import create_app
 from repository.position import PositionRepository
 
 CONFIG_PATH = BASE_DIR / "config" / "positions.yaml"
+#: 测试用业务配置：与线上 positions.yaml 规则一致，但主管身份是 mock 值。
+#: 线上那份被 HR 改成真实 open_id / 163 邮箱后，测试里硬编码的 ou_mock_* 断言会集体失效，
+#: 所以测试与线上配置解耦（见 tests/fixtures/positions.test.yaml 顶部说明）。
+TEST_CONFIG_PATH = Path(__file__).resolve().parent / "fixtures" / "positions.test.yaml"
 TEMPLATES_DIR = BASE_DIR / "config" / "templates"
 
 
@@ -32,11 +36,14 @@ def settings(tmp_path: Path) -> Settings:
         _env_file=None,
         database_url=f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}",
         var_dir=tmp_path / "var",
-        config_path=CONFIG_PATH,
+        config_path=TEST_CONFIG_PATH,
         templates_dir=TEMPLATES_DIR,
         feishu_mode="mock",
         mail_mode="mock",
         llm_mode="off",
+        # 测试聚焦「发送路径」本身，关掉人工确认闸门；
+        # 闸门自身的用例见 tests/test_interview_confirm_gate.py
+        interview_notice_require_confirm=False,
         scheduler_enabled=False,
         inbound_poll_seconds=0,
         schedule_cron="0 9 * * *",

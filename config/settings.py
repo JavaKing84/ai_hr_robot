@@ -52,6 +52,32 @@ class Settings(BaseSettings):
     feishu_app_secret: str = ""
     feishu_verification_token: str = ""
     feishu_encrypt_key: str = ""
+    # 群机器人（自定义机器人）webhook：2026-11-13 起主管/HR 的推送统一走群，
+    # 不再逐个 open_id 单聊私信。留空则自动回落到 open_id 私信（旧行为）。
+    feishu_webhook_url: str = ""
+    # 群机器人的 chat_id（oc_xxx）：自定义机器人 webhook 不能上传文件，
+    # 简历压缩包要用应用身份发到同一个群，必须知道 chat_id。留空则只发文本+本地路径。
+    feishu_chat_id: str = ""
+    # group = 全部出站消息进群；user = 保持旧的 open_id 私信
+    feishu_push_target: Literal["group", "user"] = "group"
+    # 群消息 @ 谁（open_id 列表，逗号分隔）；留空则 @所有人
+    feishu_mention_open_ids: str = ""
+
+    # 面试通知确认闸门（测试期间默认开启）：
+    # True = 只挂起、不发送，必须由 HR 人工确认后才投递；
+    # False = 主管给出名单后直接发送（生产环境确认过再用）。
+    interview_notice_require_confirm: bool = True
+
+    # 面试通知确认请求发往哪个飞书用户（open_id）。
+    # 留空 = 发给触发这次安排的岗位主管；填了则统一发给该 HR 本人。
+    hr_feishu_open_id: str = ""
+
+    # 语义分影子模式（校准期默认开启）：
+    # True  = 照常调用大模型打分并落库留痕，但「通过与否」仍按规则分判定；
+    # False = 融合分（规则分与语义分加权）真正决定通过。
+    # 为什么要影子：阈值 55/60 是按纯规则分布定的，语义分一上来就参与判定，
+    # 通过名单会整体平移，无法判断是「改好了」还是「改坏了」。
+    semantic_shadow: bool = True
 
     # LLM
     llm_mode: Literal["auto", "live", "off"] = "auto"
@@ -60,6 +86,13 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
     llm_fallback_models: str = ""
     llm_timeout_seconds: float = Field(default=45.0, gt=0)
+    #: 多供应商链（JSON 数组）。每一项形如
+    #: ``{"name": "学院-qwen3.8-27b", "model": "openai/qwen3.8-27b",
+    #:    "api_base": "http://202.204.64.234:11434/v1", "api_key": "ideal@2026"}``
+    #: 顺序即降级顺序；留空则退回单供应商（LLM_MODEL + OPENAI_BASE_URL + OPENAI_API_KEY）。
+    llm_providers: str = ""
+    #: 是否让大模型做「深度解析」（分维度打分 + 亮点/风险/面试追问点）
+    llm_deep_analysis: bool = True
 
     # 邮件
     mail_mode: Literal["mock", "live", "off"] = "mock"
@@ -111,12 +144,74 @@ class Settings(BaseSettings):
             return False
         if self.llm_mode == "live":
             return True
-        return bool(self.openai_api_key)
+        # auto：只要配了「多供应商链」或单供应商 key 就启用
+        return bool(self.llm_provider_chain or self.openai_api_key)
+
+    @property
+    def llm_provider_chain(self) -> list[dict[str, str]]:
+        """解析 ``LLM_PROVIDERS``（JSON 数组）为降级顺序列表。
+
+        每项统一成 ``{"name", "model", "api_base", "api_key"}``：
+        - ``model`` 没写供应商前缀时补 ``openai/``（三个学院/DeepSeek 端点都是
+          OpenAI 兼容的 ``/v1`` 接口，litellm 用 ``openai/`` 前缀 + api_base 即可路由）；
+        - 解析失败不抛异常、只返回空列表——配置写坏时静默退回规则抽取，绝不让
+          整轮任务因为一个 JSON 写错而崩掉。
+        """
+        import json
+
+        raw = (self.llm_providers or "").strip()
+        if not raw:
+            return []
+        try:
+            items = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(items, list):
+            return []
+
+        chain: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            model = str(item.get("model") or "").strip()
+            if not model:
+                continue
+            if "/" not in model:
+                model = f"openai/{model}"
+            api_base = str(item.get("api_base") or item.get("api_url") or "").strip()
+            # 允许直接贴 /chat/completions 结尾的完整地址，这里统一裁成 base
+            for suffix in ("/chat/completions", "/completions"):
+                if api_base.endswith(suffix):
+                    api_base = api_base[: -len(suffix)]
+            api_key = str(item.get("api_key") or "").strip()
+            key = (model, api_base)
+            if key in seen:
+                continue
+            seen.add(key)
+            chain.append(
+                {
+                    "name": str(item.get("name") or model),
+                    "model": model,
+                    "api_base": api_base,
+                    "api_key": api_key,
+                }
+            )
+        return chain
 
     @property
     def llm_fallback_model_list(self) -> list[str]:
         """``LLM_FALLBACK_MODELS`` 逗号分隔的降级候选模型列表（已去空、去重）。"""
         return [m.strip() for m in self.llm_fallback_models.split(",") if m.strip()]
+
+    @property
+    def feishu_group_push(self) -> bool:
+        """出站是否走群机器人 webhook。"""
+        return bool(self.feishu_webhook_url) and self.feishu_push_target == "group"
+
+    @property
+    def feishu_mention_list(self) -> list[str]:
+        return [x.strip() for x in (self.feishu_mention_open_ids or "").split(",") if x.strip()]
 
     @property
     def mail_live(self) -> bool:

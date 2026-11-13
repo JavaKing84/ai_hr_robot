@@ -32,7 +32,7 @@ departments:
     supervisor:
       name: 张伟
       title: 张总
-      feishu_open_id: ou_241baa285164063f94a0f3dcf7f2459e
+      feishu_open_id: ou_158953a5c9f55549940acecacd7e47a0
       email: 18786112948@163.com
     positions:
       - code: backend_senior
@@ -45,6 +45,9 @@ departments:
         screening:
           threshold: 60
           rule_version: v1
+          # 语义分权重（%）：最终分 = 规则分 ×(1-w) + 大模型语义分 ×w。
+          # 0 = 只按规则打分；建议 25~35，超过 40 规则底线就形同虚设。
+          semantic_weight: 30
           hard_conditions:
             - field: education_level
               operator: gte
@@ -90,6 +93,9 @@ departments:
         screening:
           threshold: 60
           rule_version: v1
+          # 算法岗语义区分度最高（「做过 NLP 落地」vs「只是用过 PyTorch」
+          # 关键词分不出来），权重给到 35。
+          semantic_weight: 35
           hard_conditions:
             - field: education_level
               operator: gte
@@ -120,11 +126,56 @@ departments:
               value: [人工智能, 计算机, 数学, 统计, 自动化, 模式识别]
               label: 专业相关性
 
+      # ---------------------------------------------------------------------
+      # 2026-11-12 新增：BOSS直聘转发的岗位名是「python开发工程师」，与原有
+      # 「高级后端工程师」的关键词口径不一致，容易被判「无法归位」。
+      # 放在技术部最后：与 backend_senior 命中数相同时由后者优先，避免改动
+      # 已有职位的归位结果；若想让 Python 岗优先，把这一整块移到列表首位。
+      # ---------------------------------------------------------------------
+      - code: python_developer
+        title: Python开发工程师
+        headcount: 2
+        description: >-
+          负责业务系统的 Python 后端服务开发与大模型应用落地，要求掌握 Python，
+          熟悉 FastAPI/Django/Flask 任一框架与 SQL 数据库、接口设计；
+          接受应届生及 1 年以内经验的初级候选人。
+        keywords: [Python开发工程师, Python开发, 软件开发, 后端开发, 大模型应用, Django, Flask]
+        screening:
+          threshold: 55
+          rule_version: v1
+          semantic_weight: 30
+          hard_conditions:
+            - field: education_level
+              operator: gte
+              value: 本科
+              label: 学历本科及以上
+          weighted:
+            - field: skills
+              operator: contains_any
+              weight: 45
+              value: [Python, FastAPI, Django, Flask, MySQL, PostgreSQL, Redis, Docker, Git, SQL]
+              label: Python 技术栈匹配度
+            - field: project_highlights
+              operator: contains_any
+              weight: 25
+              value: [接口, 后端, 服务, 大模型, 上线, 重构, 性能优化, 自动化测试]
+              label: 项目经验相关度
+            - field: major
+              operator: contains_any
+              weight: 15
+              value: [计算机, 软件, 电子信息, 人工智能, 数学, 自动化]
+              label: 专业相关性
+            - field: years_experience
+              operator: gte
+              weight: 15
+              value: 1
+              label: 经验年限
+
   - name: 产品部
     supervisor:
       name: 李娜
       title: 李总
-      feishu_open_id: ou_mock_lina
+      feishu_open_id: ou_158953a5c9f55549940acecacd7e47a0
       email: lina@xingye-test.com
     positions:
       - code: product_manager
@@ -137,6 +188,7 @@ departments:
         screening:
           threshold: 55
           rule_version: v1
+          semantic_weight: 25
           hard_conditions:
             - field: education_level
               operator: gte
@@ -172,7 +224,7 @@ departments:
     supervisor:
       name: 王强
       title: 王总
-      feishu_open_id: ou_mock_wangqiang
+      feishu_open_id: ou_158953a5c9f55549940acecacd7e47a0
       email: wangqiang@xingye-test.com
     positions:
       - code: marketing_specialist
@@ -185,6 +237,7 @@ departments:
         screening:
           threshold: 45
           rule_version: v1
+          semantic_weight: 25
           hard_conditions:
             - field: education_level
               operator: gte
