@@ -4,6 +4,8 @@ uvicorn[standard]>=0.27
 sqlalchemy[asyncio]>=2.0
 asyncpg>=0.29
 aiosqlite>=0.19
+# 数据库迁移：schema 变更走版本化迁移（生产用 PG，测试也用 PG）
+alembic>=1.13
 pydantic>=2.6
 pydantic-settings>=2.2
 email-validator>=2.1

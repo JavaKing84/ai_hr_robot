@@ -83,14 +83,16 @@ class FeishuClient:
 
     # --------------------------------------------------------- 出站：群机器人
     async def send_group_text(self, text: str, *, at_all: bool = False) -> FeishuSendResult:
-        """通过自定义机器人 webhook 把文本发到群里。
+        """把文本发到群里。
+
+        优先用**应用身份**（``im/v1/messages`` 发到 ``FEISHU_CHAT_ID``），与压缩包同一条
+        通道——只要机器人在群里、应用有 ``im:message:send_as_bot`` 就能发，不再依赖
+        群里那个「自定义机器人 webhook」（2026-11-13 该 webhook 被停用导致文字
+        全部 19007 Bot Not Enabled，而文件却能发）。没配 ``FEISHU_CHAT_ID`` 时才回退 webhook。
 
         群机器人只认 ``msg_type`` 与 ``content``，@人 用 ``<at user_id="ou_xxx"></at>``
         片段拼在文本里；配置了 ``FEISHU_MENTION_OPEN_IDS`` 就 @ 指定人，否则不发 @。
         """
-        if not self.settings.feishu_webhook_url:
-            return FeishuSendResult(ok=False, mode=self.mode, error="缺少 FEISHU_WEBHOOK_URL")
-
         mentions = self.settings.feishu_mention_list
         content_text = text
         if at_all:
@@ -98,8 +100,6 @@ class FeishuClient:
         elif mentions:
             prefix = " ".join(f'<at user_id="{oid}"></at>' for oid in mentions)
             content_text = f"{prefix} {text}"
-
-        payload: dict[str, Any] = {"msg_type": "text", "content": {"text": content_text}}
 
         if not self.settings.feishu_live:
             message_id = f"mock-feishu-group-{uuid.uuid4().hex[:16]}"
@@ -109,7 +109,50 @@ class FeishuClient:
             )
             return FeishuSendResult(ok=True, mode="mock", message_id=message_id)
 
-        return await self._post_webhook(payload, kind="text")
+        chat_id = (self.settings.feishu_chat_id or "").strip()
+        if chat_id:
+            return await self._send_chat_text(chat_id, content_text)
+
+        if not self.settings.feishu_webhook_url:
+            return FeishuSendResult(
+                ok=False, mode=self.mode, error="缺少 FEISHU_CHAT_ID 与 FEISHU_WEBHOOK_URL"
+            )
+        return await self._post_webhook(
+            {"msg_type": "text", "content": {"text": content_text}}, kind="text"
+        )
+
+    async def _send_chat_text(self, chat_id: str, text: str) -> FeishuSendResult:
+        """应用身份给群发文本（不阻塞事件循环：SDK 同步调用放到线程池）。"""
+
+        def _call() -> Any:
+            from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+
+            request = (
+                CreateMessageRequest.builder()
+                .receive_id_type("chat_id")
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("text")
+                    .content(json.dumps({"text": text}))
+                    .build()
+                )
+                .build()
+            )
+            return self._sdk().im.v1.message.create(request)
+
+        try:
+            response = await asyncio.to_thread(_call)
+            if not response.success():
+                error = f"code={response.code} msg={response.msg}"
+                logger.warning("feishu.send_chat_text.rejected", extra=log_extra(error=error))
+                return FeishuSendResult(ok=False, mode="live", error=error)
+            return FeishuSendResult(
+                ok=True, mode="live", message_id=getattr(response.data, "message_id", "") or ""
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("feishu.send_chat_text.failed", extra=log_extra(error=str(exc)))
+            return FeishuSendResult(ok=False, mode="live", error=str(exc))
 
     async def send_group_file(
         self, file_path: str | Path, *, file_name: str | None = None

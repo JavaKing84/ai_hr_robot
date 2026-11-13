@@ -77,6 +77,10 @@ class ScreeningConfig(BaseModel):
         le=100,
         description="LLM 语义匹配分在总分中的权重（0 表示只按规则打分）",
     )
+    always_pass_names: list[str] = Field(
+        default_factory=list,
+        description="白名单：名单中的候选人跳过全部筛选直接通过（用于主测试简历验收）",
+    )
     rule_version: str = "v1"
 
 

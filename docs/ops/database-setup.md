@@ -1,8 +1,9 @@
 # 数据库配置（PostgreSQL）
 
-> 对应改动：`AGENT.md` §4-A.6(a)。本地开发与调试统一使用 **PostgreSQL**，消灭
-> 「本地 SQLite / 生产 PG」的行为差异；**测试环境仍用内存 SQLite**（保证速度）。
-> 实现文件：`core/db.py`（`build_engine` 中 `if database_url.startswith("sqlite")` 分支保留）。
+> 对应改动：`AGENT.md` §4-A.6(a)。**生产、本地开发、测试三套环境现在统一使用 PostgreSQL**
+> （2026-11-13 起），彻底消灭「SQLite / PG」的行为差异。
+> 实现文件：`core/db.py`（`build_engine` 中 `if database_url.startswith("sqlite")` 分支保留，
+> 仅作为历史兼容，正常路径不会再走到）。
 
 ---
 
@@ -12,10 +13,13 @@
 |---|---|---|
 | 生产（docker-compose） | PostgreSQL | `docker-compose.yml` 内 `postgresql+asyncpg://hr:hr@postgres:5432/hr_robot` |
 | 本地开发 / 调试 | PostgreSQL | `.env` 或 `config/settings.py` 默认 `postgresql+asyncpg://hr:hr@localhost:5432/hr_robot` |
-| 测试（Pytest） | SQLite（内存/临时文件） | `tests/conftest.py` 注入 `sqlite+aiosqlite:///{tmp}/test.db`，**不读 `.env`** |
+| 测试（Pytest） | PostgreSQL | `tests/conftest.py` **自动派生** `hr_robot_test` 库（不存在则自动创建），不读 `_env_file` 的业务配置 |
 
-> 为什么测试仍用 SQLite：`tests/conftest.py` 的 `settings` fixture 用 `_env_file=None` +
-> 显式传 SQLite 连接串，因此**改默认值不影响测试**，测试始终离线、快速、可重复。
+> 测试怎么做到「零人工准备」：`tests/conftest.py` 从 `.env` 的 `DATABASE_URL` 派生
+> `<库名>_test`，自动 `CREATE DATABASE`，每个用例开始前 `TRUNCATE ... RESTART IDENTITY CASCADE`，
+> 等价于「每个用例一个全新的库」。PG 没启动时会自动尝试 `docker compose up -d postgres`，
+> 仍失败才打印一条可直接照抄的启动命令后退出。
+> 想换测试库：设环境变量 `TEST_DATABASE_URL`；想禁止自动拉起 docker：`TEST_PG_AUTOSTART=0`。
 
 ---
 
@@ -157,7 +161,7 @@ SELECT DISTINCT status FROM candidates;
 
 ## 6. 边界（本项目主动不做）
 
-- **不**删除 `core/db.py` 的 sqlite 分支（测试继续用内存 SQLite 提速）；
+- **不**物理删除 `core/db.py` 的 sqlite 分支（历史兼容，正常路径不再使用）；
 - **不**改任何表结构 / ORM 模型 / 查询逻辑；
-- **不**引入 Alembic 或其他迁移框架（表结构稳定在 MVP，见 D-010）；
+- 迁移工具**已引入 Alembic**（2026-11-13，见 `migrations/`），schema 变更一律走版本化迁移；
 - **不**改 `docker-compose.yml` 的 app 侧 `DATABASE_URL`（本来就是 PG）。

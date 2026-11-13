@@ -318,8 +318,8 @@ hr_ai_robot/
 │       └── OPTIMIZATION-NOTES.md    # 优化记录（验收后归档）
 │
 └── var/                             # 【运行时，已 gitignore】产物都在这
-    ├── hr.db                        # 本地 SQLite 库（.env 里指到这）
-    ├── hr_robot.db                  # 旧 SQLite 库（迁移前遗留）
+    ├── hr.db                        # 旧 SQLite 库（历史遗留，已不再使用，可删）
+    ├── hr_robot.db                  # 旧 SQLite 库（迁移前遗留，可删）
     ├── resumes/                     # 简历原件，文件名带时间戳
     ├── packages/                    # 打好的 zip 简历包
     ├── outbox/mail/                 # mock 模式发出的 .eml
@@ -333,7 +333,8 @@ hr_ai_robot/
 
 ## 4. 本地运行指南
 
-默认用 **SQLite** 就能跑通全闭环（零外部依赖，飞书/邮件/LLM 全 mock）；要用 PostgreSQL 见文末。
+数据库统一用 **PostgreSQL**（生产 / 本地 / 测试同一套引擎，不再有 SQLite 分支差异）。
+一条命令起库：`docker compose up -d postgres`（用户 `hr` / 密码 `hr` / 库 `hr_robot` / 端口 5432）。飞书、邮件、LLM 仍可全 mock，不配凭证也能跑通闭环。
 
 ### 4.1 Windows
 
@@ -354,10 +355,10 @@ python -m pip install -r requirements.txt
 copy .env.example .env
 ```
 
-打开 `.env`，把数据库改成 SQLite（其余保持 mock 即可）：
+确认 `.env` 里数据库指向 PostgreSQL（默认即是），其余保持 mock 即可：
 
 ```ini
-DATABASE_URL=sqlite+aiosqlite:///./var/hr.db
+DATABASE_URL=postgresql+asyncpg://hr:hr@localhost:5432/hr_robot
 FEISHU_MODE=mock
 MAIL_MODE=mock
 LLM_MODE=auto
@@ -365,16 +366,20 @@ SCHEDULE_CRON=0 9 * * *
 ```
 
 ```bat
-:: 5) 建表 + 写入测试公司（3 部门 / 3 主管 / 5 职位）
+:: 5) 起数据库（需 Docker Desktop，只需第一次/重启后执行）
+docker compose up -d postgres
+
+:: 6) 建表（走 Alembic 迁移，版本化） + 写入测试公司（3 部门 / 3 主管 / 5 职位）
+python -m alembic upgrade head
 python scripts\seed.py --reset
 
-:: 6) 一条命令看完整个闭环（打印机器人真正发出的飞书文本和邮件正文）
+:: 7) 一条命令看完整个闭环（打印机器人真正发出的飞书文本和邮件正文）
 python scripts\demo.py --verbose
 
-:: 7) 起服务（另开一个窗口；或双击「启动简历测试.bat」）
+:: 8) 起服务（另开一个窗口；或双击「启动简历测试.bat」）
 python -m uvicorn core.main:app --host 127.0.0.1 --port 8000
 
-:: 8) 手动触发一轮
+:: 9) 手动触发一轮
 curl -X POST http://127.0.0.1:8000/api/v1/recruitment/run
 ```
 
@@ -401,37 +406,53 @@ python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-编辑 `.env`，把数据库改成 SQLite（Linux 可直接 sed，macOS 用 `sed -i ''`）：
+编辑 `.env` 确认数据库指向 PostgreSQL（默认即是，无需改动）：
 
 ```bash
-sed -i 's#^DATABASE_URL=.*#DATABASE_URL=sqlite+aiosqlite:///./var/hr.db#' .env
-# macOS: sed -i '' 's#^DATABASE_URL=.*#DATABASE_URL=sqlite+aiosqlite:///./var/hr.db#' .env
+grep '^DATABASE_URL' .env      # 应为 postgresql+asyncpg://hr:hr@localhost:5432/hr_robot
 ```
 
 ```bash
-# 5) 建表 + 写入测试公司
+# 5) 起数据库（需 Docker）
+docker compose up -d postgres
+
+# 6) 建表（Alembic 迁移） + 写入测试公司
+python -m alembic upgrade head
 python scripts/seed.py --reset
 
-# 6) 一条命令跑完整个闭环
+# 7) 一条命令跑完整个闭环
 python scripts/demo.py --verbose
 
-# 7) 起服务
+# 8) 起服务
 python -m uvicorn core.main:app --host 127.0.0.1 --port 8000
 ```
 
 ```bash
-# 8) 另开一个终端，手动触发一轮
+# 9) 另开一个终端，手动触发一轮
 curl -X POST http://127.0.0.1:8000/api/v1/recruitment/run
 ```
 
 验收同 Windows：`curl http://127.0.0.1:8000/health` 返回 `status: ok`。
 
-### 4.3 换成 PostgreSQL（可选）
+### 4.3 跑测试（同样需要 PostgreSQL）
 
 ```bash
-docker compose up -d postgres          # 只起数据库，端口 5432
-# .env 改回：DATABASE_URL=postgresql+asyncpg://hr:hr@localhost:5432/hr_robot
-python scripts/seed.py --reset
+docker compose up -d postgres     # 测试库需要 PG 在线
+python -m pytest -q               # 190 个用例
 ```
 
-旧 SQLite 数据搬过去：`python scripts/migrate_sqlite_to_pg.py --dry-run` 先看统计，去掉 `--dry-run` 正式迁移。整包容器化：`docker compose up --build`。
+> 测试库**不需要手工创建**：`tests/conftest.py` 会从 `DATABASE_URL` 派生 `hr_robot_test`，
+> 不存在就自动 `CREATE DATABASE`，每个用例前 `TRUNCATE` 清空。PG 没起时它会先尝试
+> `docker compose up -d postgres`，仍失败才打印一条可直接照抄的启动命令并退出。
+> 想用别的测试库：设 `TEST_DATABASE_URL`；想禁止自动拉起 docker：`TEST_PG_AUTOSTART=0`。
+
+### 4.4 升级表结构（Alembic）
+
+```bash
+python -m alembic upgrade head          # 升级到最新版本
+python -m alembic current               # 看当前版本
+python -m alembic revision --autogenerate -m "说明"   # 改了 ORM 模型后生成迁移
+python -m alembic check                 # 校验「模型 vs 迁移」有没有漂移
+```
+
+旧 SQLite 数据如仍需搬迁：`python scripts/migrate_sqlite_to_pg.py --dry-run` 先看统计，去掉 `--dry-run` 正式迁移。整包容器化：`docker compose up --build`。

@@ -148,6 +148,18 @@ def evaluate(
     这样同一批简历可以同时看到「规则判定」和「融合判定」两种结果。
     ``deep_analysis`` 只做展示与留痕，不参与判定（防止模型一句话改变录用结果）。
     """
+    # 白名单：主测试简历等指定候选人跳过全部筛选（硬性条件/打分/阈值）直接通过
+    name = str(_actual(source, "name") or "").strip()
+    whitelist = {str(n).strip() for n in screening.always_pass_names if str(n).strip()}
+    if name and name in whitelist:
+        return ScreeningResult(
+            passed=True,
+            score=100.0,
+            threshold=screening.threshold,
+            rule_version=screening.rule_version,
+            reason=f"白名单命中（{name}），跳过筛选直接通过",
+        )
+
     hard_results: list[HardConditionResult] = []
     hard_failed: list[str] = []
     hard_unknown: list[str] = []

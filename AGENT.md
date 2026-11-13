@@ -28,7 +28,7 @@
 | 项 | 要求 | 说明 |
 |---|---|---|
 | Python | **>= 3.11** | 用到 `X \| None` 等新语法；镜像 `python:3.11-slim` |
-| 数据库 | 本地/测试：SQLite；生产：**PostgreSQL** | 生产默认 `postgresql+asyncpg`；测试由 `tests/conftest.py` 注入内存 SQLite |
+| 数据库 | **PostgreSQL**（本地 / 测试 / 生产统一） | 生产 `postgresql+asyncpg://hr:hr@postgres:5432/hr_robot`；测试自动派生 `hr_robot_test` 库（`tests/conftest.py`，不存在则自动建、每个用例前清空） |
 | 飞书 | 自建应用 | 需 `im:message`、上传/获取文件资源、通过手机号或邮箱获取用户 ID；订阅 `im.message.receive_v1`；版本已发布且在可用范围内 |
 | 邮箱 | 支持 **IMAP + SMTP** | 建议专职 HR 邮箱；SSL 常用 993 / 465 |
 | 大模型 | OpenAI 兼容接口（经 litellm） | 无 key 时自动走确定性规则抽取，闭环仍可跑 |
@@ -216,6 +216,7 @@ interview_notified                          已邮件通知
 | `API.md` | 全部 HTTP 接口与错误码 |
 | `AGENT.md` | 本文件：边界、环境、配置、纪律、状态机 |
 | `DECISIONS.md` | 决策台账：为什么这么设计、与契约的偏差、明确不做 |
+| `docs/改动记录.md` | **每次改动都追加一条**：改了什么 / 为什么 / 改了哪些文件 / 怎么验证 |
 | `最简测试指南.md` | 用真邮箱 + 真飞书实测一遍的操作手册 |
 | `docs/unattended-protocol.md` | 无人值守部署、监控、故障处置 |
 | `docs/database-setup.md` | PostgreSQL 配置与旧库迁移 |

@@ -1,12 +1,30 @@
-"""pytest 公共夹具：临时 SQLite、应用容器、HTTP 客户端。
+"""pytest 公共夹具：PostgreSQL 测试库、应用容器、HTTP 客户端。
 
 所有外部系统都跑在 mock 模式（飞书不发请求、邮件写本地 outbox、LLM 关闭），
-因此测试完全离线、可重复。
+因此测试完全离线、可重复；**只有数据库是真实 PostgreSQL**（与生产同引擎，
+提前暴露 PG 才有的差异：字段长度、JSON、外键、序列）。
+
+测试库的生命周期全自动，不需要人工建库或改任何配置：
+
+1. 从 ``.env`` 的 ``DATABASE_URL`` 派生 ``<库名>_test``（如 ``hr_robot_test``）；
+2. 库不存在就自动 ``CREATE DATABASE``；
+3. 每个用例开始前 ``TRUNCATE ... RESTART IDENTITY CASCADE``，等价于一个全新的库；
+4. 若 PostgreSQL 没启动，会自动尝试 ``docker compose up -d postgres``，
+   仍失败则打印一条可以直接照抄的启动命令后退出（不会给你一堆看不懂的堆栈）。
+
+可用环境变量覆盖：
+- ``TEST_DATABASE_URL``：直接指定测试库（跳过派生）；
+- ``TEST_PG_AUTOSTART=0``：禁止自动拉起 docker（CI 里想自己控制时用）。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import shutil
+import subprocess
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,7 +35,13 @@ from httpx import ASGITransport, AsyncClient
 
 from client.mailbox import InboundEmail, parse_email_bytes
 from config.settings import BASE_DIR, Settings
-from core.db import init_models
+from core.db import (
+    build_engine,
+    derive_test_database_url,
+    ensure_database_exists,
+    init_models,
+    truncate_all_tables,
+)
 from core.deps import Container, build_container, build_services
 from factory.app import create_app
 from repository.position import PositionRepository
@@ -30,11 +54,137 @@ TEST_CONFIG_PATH = Path(__file__).resolve().parent / "fixtures" / "positions.tes
 TEMPLATES_DIR = BASE_DIR / "config" / "templates"
 
 
+# ------------------------------------------------------- PostgreSQL 测试库准备
+
+
+def _resolve_test_database_url() -> str:
+    """确定测试库地址：显式 ``TEST_DATABASE_URL`` 优先，否则由运行库派生。"""
+    explicit = (os.getenv("TEST_DATABASE_URL") or "").strip()
+    if explicit:
+        return explicit
+
+    # 读 .env 里的 DATABASE_URL（环境变量 DATABASE_URL 优先级更高，由 Settings 处理）
+    base_url = Settings().database_url
+    if base_url.startswith("sqlite"):
+        pytest.exit(
+            "测试已改为必须使用 PostgreSQL，但当前 DATABASE_URL 仍是 SQLite：\n"
+            f"  {base_url}\n"
+            "请把 .env 的 DATABASE_URL 改成 "
+            "postgresql+asyncpg://hr:hr@localhost:5432/hr_robot，"
+            "或设置环境变量 TEST_DATABASE_URL 指向测试库。",
+            returncode=1,
+        )
+    return derive_test_database_url(base_url)
+
+
+def _probe(url: str) -> None:
+    """连一次库（不存在则创建）；连不上直接抛异常。"""
+    asyncio.run(ensure_database_exists(url))
+
+
+def _try_start_postgres(url: str, attempts: int = 40, interval: float = 1.0) -> None:
+    """尝试用 docker compose 拉起 postgres，并轮询到可用为止。"""
+    if shutil.which("docker") is None:
+        raise RuntimeError("本机找不到 docker 命令")
+
+    result = subprocess.run(
+        ["docker", "compose", "up", "-d", "postgres"],
+        cwd=str(BASE_DIR),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        raise RuntimeError("docker compose up -d postgres 执行失败：" + (detail[-1] if detail else "未知原因"))
+
+    for index in range(attempts):
+        try:
+            _probe(url)
+            return
+        except Exception:  # noqa: BLE001 - 容器启动中，继续轮询
+            if index == attempts - 1:
+                raise
+            time.sleep(interval)
+
+
+def _prepare_test_database(url: str) -> None:
+    """确保测试库可连接、库存在；必要时自动拉起 docker。"""
+    try:
+        _probe(url)
+        return
+    except Exception as first_error:  # noqa: BLE001
+        autostart = (os.getenv("TEST_PG_AUTOSTART") or "1").strip().lower()
+        if autostart in {"0", "false", "no", "off"}:
+            pytest.exit(_pg_unavailable_message(url, first_error, autostart_disabled=True), returncode=1)
+        try:
+            _try_start_postgres(url)
+            return
+        except Exception as start_error:  # noqa: BLE001
+            pytest.exit(
+                _pg_unavailable_message(url, first_error, startup_error=start_error),
+                returncode=1,
+            )
+
+
+def _pg_unavailable_message(
+    url: str,
+    error: Exception,
+    *,
+    autostart_disabled: bool = False,
+    startup_error: Exception | None = None,
+) -> str:
+    lines = [
+        "",
+        "=" * 78,
+        "测试需要 PostgreSQL，但当前连不上。",
+        "=" * 78,
+        f"目标库：{url}",
+        f"错误：{type(error).__name__}: {error}",
+    ]
+    if autostart_disabled:
+        lines.append("（已设置 TEST_PG_AUTOSTART=0，因此不自动启动数据库）")
+    if startup_error is not None:
+        lines.append(f"自动启动失败：{type(startup_error).__name__}: {startup_error}")
+    lines += [
+        "",
+        "请按顺序做这两步，然后重新运行 pytest：",
+        "  1) 确认 Docker Desktop 已启动",
+        f"  2) 在 {BASE_DIR} 目录执行：docker compose up -d postgres",
+        "",
+        "不需要手工建库：测试会自动创建 hr_robot_test 并在每个用例前清空数据。",
+        "=" * 78,
+        "",
+    ]
+    return "\n".join(lines)
+
+
+async def _create_schema(url: str) -> None:
+    """会话开始时按 ORM 模型建一次表（幂等）。"""
+    engine = build_engine(url)
+    try:
+        await init_models(engine)
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture(scope="session")
+def test_database_url() -> str:
+    """会话级：准备 PostgreSQL 测试库并建表，返回连接串。"""
+    url = _resolve_test_database_url()
+    _prepare_test_database(url)
+    asyncio.run(_create_schema(url))
+    return url
+
+
+# --------------------------------------------------------------------- 核心夹具
+
+
 @pytest.fixture
-def settings(tmp_path: Path) -> Settings:
+def settings(tmp_path: Path, test_database_url: str) -> Settings:
     return Settings(
         _env_file=None,
-        database_url=f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}",
+        database_url=test_database_url,
         var_dir=tmp_path / "var",
         config_path=TEST_CONFIG_PATH,
         templates_dir=TEMPLATES_DIR,
@@ -53,10 +203,22 @@ def settings(tmp_path: Path) -> Settings:
 @pytest.fixture
 async def container(settings: Settings) -> AsyncIterator[Container]:
     container = build_container(settings)
+    # 每个用例都从「空表 + 自增 ID 归零」开始，等价于一个全新的库，
+    # 用例之间互不影响，顺序可以随便打乱。
+    await truncate_all_tables(container.engine)
     await init_models(container.engine)
     async with container.session_factory() as session:
         await PositionRepository(session).sync_from_config(settings.load_company_config())
         await session.commit()
+        # 夹具自检：岗位没同步进来时，业务会输出「没有在招职位（配置为空）」，
+        # 那个报错指向业务配置，会让人查错方向；这里提前失败并说清是夹具问题。
+        if not await PositionRepository(session).list_active():
+            pytest.fail(
+                "测试夹具异常：岗位配置同步后岗位表仍为空。\n"
+                f"  配置：{settings.config_path}\n"
+                f"  库：{settings.database_url}\n"
+                "通常是 positions.test.yaml 解析为空，或数据库连接指向了别的库。"
+            )
     yield container
     await container.aclose()
 

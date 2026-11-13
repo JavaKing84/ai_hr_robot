@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db import Base
@@ -72,7 +72,9 @@ class Candidate(TimestampMixin, Base):
     phone: Mapped[str] = mapped_column(String(32), default="", index=True)
 
     # 职位归位（冗余存 code / department，避免异步懒加载）
-    position_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    position_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("positions.id", ondelete="SET NULL"), index=True, nullable=True
+    )
     position_code: Mapped[str] = mapped_column(String(64), default="", index=True)
     department: Mapped[str] = mapped_column(String(64), default="")
 

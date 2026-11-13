@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Float, Integer, String, Text
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db import Base
@@ -34,9 +34,15 @@ class Message(TimestampMixin, Base):
     subject: Mapped[str] = mapped_column(String(512), default="")
     body: Mapped[str] = mapped_column(Text, default="")
 
-    candidate_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
-    position_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
-    supervisor_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    candidate_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("candidates.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    position_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("positions.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    supervisor_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("supervisors.id", ondelete="SET NULL"), index=True, nullable=True
+    )
 
     external_id: Mapped[str] = mapped_column(String(255), default="", index=True)  # 飞书 message_id / 邮件 Message-ID
     thread_key: Mapped[str] = mapped_column(String(255), default="", index=True)

@@ -546,25 +546,44 @@ class ResumeParser:
 
     # -------------------------------------------------------------- 文本提取
     def _extract_text(self, path: Path) -> tuple[str, str, int, list[str]]:
+        """按「先快后全」的顺序提取文本。
+
+        2026-11-13 调整顺序（原先是 unstructured 优先）：本机实测 ``unstructured`` 的
+        ``partition()`` 处理 docx 时会长时间卡住（>120s，疑似联网取模型），而解析又跑在
+        60s 超时的子进程里 —— 结果是**所有 docx/pdf 简历都超时降级成空文本**，
+        BOSS 直聘的 docx 附件直接被判「学历不符」淘汰。
+
+        现在的策略：先用原生库（python-docx / pypdf）快速拿到文本；只有在它**一个字都
+        没抽到**（版面复杂、扫描件）时，才把 unstructured 当兜底再试一次。
+        这样正常简历 0.1s 出结果，病态文件最多浪费一次兜底超时，不会反过来拖垮正常件。
+        """
         warnings: list[str] = []
         suffix = path.suffix.lower()
 
         if suffix in {".txt", ".md"}:
             return path.read_text(encoding="utf-8", errors="replace"), "text", 1, warnings
 
-        # 首选 unstructured：它对版面、表格、分栏的处理更稳
+        if suffix == ".pdf":
+            text, pages = _pdf_text(path, warnings)
+            if text.strip():
+                return text, "pypdf", pages, warnings
+            # 原生库抽不出内容：可能是分栏/表格版式，交给 unstructured 再试一次
+            fallback = _try_unstructured(path, warnings)
+            if fallback.strip():
+                return fallback, "unstructured", 0, warnings
+            return text, "pypdf", pages, warnings
+
+        if suffix in {".docx", ".doc"}:
+            text = _docx_text(path, warnings)
+            if text.strip():
+                return text, "python-docx", 0, warnings
+            fallback = _try_unstructured(path, warnings)
+            return (fallback, "unstructured", 0, warnings) if fallback.strip() else (text, "python-docx", 0, warnings)
+
+        # 未知扩展名：先试 unstructured，再按文本尽力读取
         text = _try_unstructured(path, warnings)
         if text.strip():
             return text, "unstructured", 0, warnings
-
-        if suffix == ".pdf":
-            text, pages = _pdf_text(path, warnings)
-            return text, "pypdf", pages, warnings
-        if suffix in {".docx", ".doc"}:
-            text = _docx_text(path, warnings)
-            return text, "python-docx", 0, warnings
-
-        # 未知扩展名：按文本尽力读取
         try:
             return path.read_text(encoding="utf-8", errors="replace"), "text-fallback", 1, warnings
         except OSError:

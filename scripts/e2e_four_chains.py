@@ -12,7 +12,8 @@
 安全边界：
 - ``MAIL_MODE=mock``：所有邮件只写 ``var/e2e/var/outbox/mail/*.eml``，**不会真的发给候选人**；
 - ``FEISHU_MODE`` 用 .env 的真实配置：飞书群推送是真的（用于验证渠道改造）；
-- 数据库用独立 SQLite（``var/e2e/e2e.db``），不污染 var/hr.db 与 PG 生产库。
+- 数据库用独立的 PostgreSQL 库 ``<库名>_e2e``（默认 ``hr_robot_e2e``），与生产库隔离，
+  每次开跑前自动建库、清空表，跑完数据仍在库里可查（想清就再跑一次）。
 """
 
 from __future__ import annotations
@@ -30,7 +31,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.settings import Settings  # noqa: E402
-from core.db import init_models  # noqa: E402
+from core.db import (  # noqa: E402
+    derive_test_database_url,
+    ensure_database_exists,
+    init_models,
+    truncate_all_tables,
+)
 from core.deps import build_container, build_services  # noqa: E402
 from core.logging import configure_logging  # noqa: E402
 from model.candidate import CandidateStatus  # noqa: E402
@@ -39,6 +45,21 @@ from schema.message import InboundMessage  # noqa: E402
 
 WORK = ROOT / "var" / "e2e"
 SAMPLES = ROOT / "测试简历"
+TESTDATA = ROOT / "tests" / "testdata"
+
+
+def sample(name: str) -> Path:
+    """定位样例简历：先找 ``测试简历/``，再在 ``tests/testdata/``（按部门分目录）里递归找。"""
+    direct = SAMPLES / name
+    if direct.exists():
+        return direct
+    matches = sorted(TESTDATA.rglob(name))
+    if matches:
+        return matches[0]
+    raise FileNotFoundError(
+        f"找不到样例简历「{name}」。\n"
+        f"请放到 {SAMPLES} 下，或放到 {TESTDATA}\\<部门>\\ 下（当前测试简历放在这里）。"
+    )
 PASS = "PASS"
 FAIL = "FAIL"
 
@@ -102,9 +123,18 @@ async def main() -> int:
         shutil.rmtree(WORK, ignore_errors=True)
     WORK.mkdir(parents=True, exist_ok=True)
 
+    # e2e 用独立 PG 库（<库名>_e2e），与生产库、pytest 测试库三者互不干扰
+    base_settings = Settings(_env_file=str(ROOT / ".env"))
+    if not base_settings.database_url.startswith("postgresql"):
+        print("DATABASE_URL 不是 PostgreSQL，无法跑四条链路验收。")
+        print(f"当前值：{base_settings.database_url}")
+        return 2
+    e2e_url = derive_test_database_url(base_settings.database_url, suffix="_e2e")
+    await ensure_database_exists(e2e_url)
+
     settings = Settings(
         _env_file=str(ROOT / ".env"),
-        database_url=f"sqlite+aiosqlite:///{(WORK / 'e2e.db').as_posix()}",
+        database_url=e2e_url,
         var_dir=WORK / "var",
         config_path=ROOT / "config" / "positions.yaml",
         templates_dir=ROOT / "config" / "templates",
@@ -114,6 +144,8 @@ async def main() -> int:
         inbound_poll_seconds=0,
     )
     container = build_container(settings)
+    # 每次开跑前清空 e2e 库，保证四个断言的计数从 0 开始
+    await truncate_all_tables(container.engine)
     await init_models(container.engine)
 
     print("=" * 78)
@@ -140,12 +172,12 @@ async def main() -> int:
             attachments=[
                 (
                     "陈昊然-简历.txt",
-                    (SAMPLES / "01_陈昊然_高级后端工程师_通过.txt").read_bytes(),
+                    sample("01_陈昊然_高级后端工程师_通过.txt").read_bytes(),
                     "plain",
                 ),
                 (
                     "林思远-简历.txt",
-                    (SAMPLES / "02_林思远_后端开发工程师_通过.txt").read_bytes(),
+                    sample("02_林思远_后端开发工程师_通过.txt").read_bytes(),
                     "plain",
                 ),
             ],
@@ -172,7 +204,7 @@ async def main() -> int:
 
         # ---------------------------------------------------------------- 链路②
         print("\n—— 链路②：BOSS直聘后台投递（平台转发邮件）——")
-        docx_bytes = build_docx((SAMPLES / "03_赵语彤_算法工程师_通过.txt").read_text(encoding="utf-8"))
+        docx_bytes = build_docx(sample("03_赵语彤_算法工程师_通过.txt").read_text(encoding="utf-8"))
         make_eml(
             inbox / "02-boss-mail.eml",
             subject="赵语彤 | 3年，应聘 算法工程师 | 北京20-30K【BOSS直聘】",

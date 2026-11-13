@@ -2,7 +2,7 @@
 # ai-hr 业务配置（HR 可直接编辑，下一轮定时任务即生效）
 #
 # 结构：company / schedule / mailbox / departments[] -> supervisor + positions[]
-#   - supervisor.feishu_open_id：ou_241baa285164063f94a0f3dcf7f2459e
+#   - supervisor.feishu_open_id：ou_158953a5c9f55549940acecacd7e47a0（本人 open_id，非群 chat_id）
 #   - supervisor.email：18786112948@163.com
 #   - positions[].screening：硬性条件（不过即淘汰）+ 加权项（0-100 归一化打分）
 #   - threshold：加权得分及格线，低于此线视为未通过
@@ -45,6 +45,8 @@ departments:
         screening:
           threshold: 60
           rule_version: v1
+          # 白名单：主测试简历，跳过全部筛选直接通过（验收链路用，上线前可清空）
+          always_pass_names: [王耀国]
           # 语义分权重（%）：最终分 = 规则分 ×(1-w) + 大模型语义分 ×w。
           # 0 = 只按规则打分；建议 25~35，超过 40 规则底线就形同虚设。
           semantic_weight: 30

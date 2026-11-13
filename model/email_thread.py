@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Integer, String
+from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db import Base
@@ -43,9 +43,15 @@ class EmailThread(TimestampMixin, Base):
     reply_address: Mapped[str] = mapped_column(String(255), default="")
     counterpart_email: Mapped[str] = mapped_column(String(255), default="", index=True)
 
-    candidate_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
-    position_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
-    supervisor_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    candidate_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("candidates.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    position_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("positions.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    supervisor_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("supervisors.id", ondelete="SET NULL"), index=True, nullable=True
+    )
 
     message_count: Mapped[int] = mapped_column(Integer, default=1)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
