@@ -154,6 +154,7 @@ def build_services(session: AsyncSession, container: Container | None = None) ->
         notification=notification,
         company=company.company,
         mailbox_config=company.mailbox,
+        llm=llm,
     )
     inbound = InboundEmailService(
         session,

@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.settings import Settings
+from client.llm import LLMClient
 from core.logging import get_logger, log_extra
 from core.timeparse import format_interview_time, now_local, parse_chinese_datetime, to_utc_naive
 from model.candidate import Candidate, CandidateStatus
@@ -32,9 +33,11 @@ from repository.candidate import CandidateRepository
 from repository.event import EventRepository
 from repository.message import MessageRepository
 from repository.position import PositionRepository
+from schema.agent import AgentIntent, AgentPlan
 from schema.config import CompanyInfo, MailboxConfig
 from schema.extraction import InterviewScheduleSchema, SourceQuote
 from schema.message import InboundMessage
+from service.agent import AgentService
 from service.extraction import ExtractionService
 from service.notification import NotificationService
 
@@ -82,6 +85,7 @@ class FeedbackService:
         notification: NotificationService,
         company: CompanyInfo | None = None,
         mailbox_config: MailboxConfig | None = None,
+        llm: LLMClient | None = None,
     ) -> None:
         self.session = session
         self.settings = settings
@@ -93,14 +97,25 @@ class FeedbackService:
         self.positions = PositionRepository(session)
         self.events = EventRepository(session)
         self.messages = MessageRepository(session)
+        #: 自然语言助手：LLM 不可用时 ``enabled=False``，所有路由调用直接返回 None，
+        #: handle() 的行为与接入前完全一致（保持离线可用）。
+        self.agent = AgentService(
+            session,
+            settings=settings,
+            llm=llm,
+            notification=notification,
+            company=self.company,
+            mailbox_config=self.mailbox_config,
+        )
 
     # ------------------------------------------------------------------ 入口
     async def handle(self, inbound: InboundMessage) -> FeedbackOutcome:
         supervisor = await self._resolve_supervisor(inbound)
-        # HR 本人不一定登记为主管：只要有待确认的面试通知，就允许他回「确认/取消」。
+        # HR 本人不一定登记在 supervisors 表里（表里通常只有部门主管）：
+        # 只要 FEISHU_OPEN_ID 对得上 HR 配置，就借用任一有职位的主管身份，
+        # 这样 HR 在群里问「现在有哪些候选人」也能被正常回答。
         if supervisor is None and (self.settings.hr_feishu_open_id or "").strip() == inbound.sender_id:
-            if await self.notification.pending_interview_notices():
-                supervisor = await self._any_supervisor()
+            supervisor = await self._any_supervisor()
         if supervisor is None:
             await self.events.record(
                 "feedback.supervisor_unknown",
@@ -121,7 +136,10 @@ class FeedbackService:
 
         # 场景 0：HR 在飞书里回复「确认 / 确认 1,3 / 取消」，放行或作废挂起的面试通知。
         # 放在最前面：这类回复既没有候选人名单也没有时间，交给排期解析会误判。
-        approval = await self._handle_interview_approval(inbound, supervisor, message_row)
+        pending_notices = await self.notification.pending_interview_notices()
+        approval = await self._handle_interview_approval(
+            inbound, supervisor, message_row, pending=pending_notices
+        )
         if approval is not None:
             await self.session.commit()
             return approval
@@ -131,16 +149,61 @@ class FeedbackService:
         )
         pending = [c for c in active if c.status == CandidateStatus.RESCHEDULE_PENDING]
 
-        # 场景 A：主管在回复“候选人改期”的请示
-        if pending and self._looks_like_reschedule_decision(inbound.text, pending):
-            outcome = await self._handle_reschedule_decision(
-                inbound, supervisor, positions, pending, message_row
+        # 场景 1（2026-11-13 新增）：自然语言路由。
+        # 模型只判断「这句话是问还是做」：
+        # - 读类 → 检索真实数据后由模型组织人话回答（不碰数据库）
+        # - 写类 → 仍交给下面的确定性代码执行（模型只提供名单与时间槽位）
+        # 模型不可用时 plan 恒为 None，下面的分支与改造前完全一致。
+        plan = await self.agent.plan(
+            inbound,
+            positions=positions,
+            roster=active,
+            pending_notices=len(pending_notices),
+            sender_title=supervisor.title or supervisor.name,
+        )
+
+        if plan is not None and (plan.is_read or plan.intent == AgentIntent.UNKNOWN):
+            # 读类意图直接由助手作答；UNKNOWN 也交给它——比固定模板更有用
+            # （模型可以说「你是想问 X 吗」，而不是甩一段格式说明）
+            reply = await self.agent.answer(
+                inbound, supervisor, plan, positions=positions, active=active
+            )
+            await self.session.commit()
+            return FeedbackOutcome(
+                handled=reply.handled,
+                action=reply.action,
+                detail=reply.detail,
+                reply_text=reply.text,
+            )
+
+        if plan is not None and plan.intent == AgentIntent.REJECT:
+            outcome = await self._handle_reject(
+                inbound, supervisor, active, plan, message_row, positions
             )
             await self.session.commit()
             return outcome
 
-        # 场景 B：主管给出面试名单 + 时间
-        outcome = await self._handle_schedule(inbound, supervisor, positions, active, message_row)
+        # 场景 A：主管在回复“候选人改期”的请示
+        if pending and (plan is None or plan.intent == AgentIntent.RESCHEDULE):
+            if self._looks_like_reschedule_decision(inbound.text, pending):
+                outcome = await self._handle_reschedule_decision(
+                    inbound, supervisor, positions, pending, message_row
+                )
+                await self.session.commit()
+                return outcome
+
+        # 场景 B：主管给出面试名单 + 时间（模型已抽出槽位时直接用，省一次调用）
+        # RESCHEDULE（「王耀国改到 11月15日上午十点」）同样是一次「名单+时间」写入，
+        # 槽位已经由路由阶段抽好，没有理由再调一次模型去猜。
+        prefilled = (
+            self._schedule_from_plan(plan)
+            if plan is not None
+            and plan.intent in (AgentIntent.SCHEDULE, AgentIntent.RESCHEDULE)
+            else None
+        )
+        outcome = await self._handle_schedule(
+            inbound, supervisor, positions, active, message_row, prefilled=prefilled
+        )
         await self.session.commit()
         return outcome
 
@@ -150,6 +213,8 @@ class FeedbackService:
         inbound: InboundMessage,
         supervisor: Supervisor,
         message_row: Message,
+        *,
+        pending: Sequence[Message] | None = None,
     ) -> FeedbackOutcome | None:
         """处理 HR 对「待确认面试通知」的确认/取消回复。
 
@@ -160,7 +225,7 @@ class FeedbackService:
         if not text:
             return None
 
-        pending = await self.notification.pending_interview_notices()
+        pending = list(pending) if pending is not None else await self.notification.pending_interview_notices()
         if not pending:
             return None
 
@@ -245,12 +310,30 @@ class FeedbackService:
         positions: Sequence[Position],
         active: Sequence[Candidate],
         message_row: Message,
+        *,
+        prefilled: InterviewScheduleSchema | None = None,
     ) -> FeedbackOutcome:
-        roster = [c for c in active if c.status in (CandidateStatus.DISPATCHED, CandidateStatus.SUPERVISOR_FEEDBACK)]
+        # 可排期名单：除了「刚派发 / 已反馈」的人，还要包含「已通知面试」与
+        # 「候选人申请改期」——否则主管说「王耀国改到 11月15日上午十点」时，
+        # 这个人不在名单里，就会被当成看不懂而回一段格式说明（2026-11-13 修）。
+        # 已通知的人重排＝改期：状态回到 SUPERVISOR_FEEDBACK 并重新走一次
+        # 通知确认闸门，不会直接给候选人发第二封邮件。
+        roster = [
+            c
+            for c in active
+            if c.status
+            in (
+                CandidateStatus.DISPATCHED,
+                CandidateStatus.SUPERVISOR_FEEDBACK,
+                CandidateStatus.INTERVIEW_NOTIFIED,
+                CandidateStatus.RESCHEDULE_PENDING,
+            )
+        ]
         roster_names = [c.name for c in roster if c.name]
         primary_position = self._primary_position(positions, roster)
 
-        schedule = self._schedule_from_card(inbound)
+        # 模型路由阶段已经抽好的槽位直接用，避免同一条消息调用两次大模型
+        schedule = prefilled or self._schedule_from_card(inbound)
         if schedule is None:
             schedule = await self.extraction.extract_interview_schedule(
                 inbound,
@@ -321,6 +404,11 @@ class FeedbackService:
                 continue
             for candidate in group:
                 from_state = candidate.status
+                # 已通知过的候选人再次被排期 = 改期，事件里留痕以便回溯
+                is_reschedule = from_state in (
+                    CandidateStatus.INTERVIEW_NOTIFIED,
+                    CandidateStatus.RESCHEDULE_PENDING,
+                )
                 candidate.status = CandidateStatus.SUPERVISOR_FEEDBACK
                 await self.session.flush()
                 await self.events.record(
@@ -335,8 +423,9 @@ class FeedbackService:
                         "location": location,
                         "source": inbound.channel,
                         "message_id": message_row.id,
+                        "reschedule": is_reschedule,
                     },
-                    note="主管确认面试名单与时间",
+                    note="主管改期" if is_reschedule else "主管确认面试名单与时间",
                 )
 
             results = await self.notification.send_interview_notices(
@@ -392,6 +481,121 @@ class FeedbackService:
                 "notices_sent": sent_total,
                 "notices_pending_confirm": pending_total,
             },
+        )
+
+    # ------------------------------------------------------- 场景 C：淘汰（自然语言）
+    async def _handle_reject(
+        self,
+        inbound: InboundMessage,
+        supervisor: Supervisor,
+        active: Sequence[Candidate],
+        plan: AgentPlan,
+        message_row: Message,
+        positions: Sequence[Position] = (),
+    ) -> FeedbackOutcome:
+        """主管说「张三不要了」——只改状态、记事件，不给候选人发任何邮件。
+
+        产品口径：本项目不发感谢信/淘汰通知，所以这里绝不触发外发。
+        「淘汰」可能针对刚筛选通过、还没发主管的人，所以候选池要覆盖
+        该主管职位下所有未被淘汰的人，而不只是可排期状态。
+        """
+        pool: dict[int, Candidate] = {c.id: c for c in active}
+        for position in positions:
+            for candidate in await self.candidates.list_by_position(position.id):
+                pool[candidate.id] = candidate
+        candidates = [
+            c for c in pool.values() if c.status != CandidateStatus.SCREENED_REJECTED
+        ]
+        known = {c.name for c in candidates if c.name}
+        names = [name for name in plan.names if name in known]
+        if not names:
+            listing = "、".join(c.name for c in candidates[:8]) or "（当前没有候选人）"
+            text = (
+                f"{supervisor.title or supervisor.name}，要淘汰哪位？\n"
+                f"当前未淘汰的候选人：{listing}\n"
+                "直接回「淘汰张三」就行。"
+            )
+            await self.notification.notify_supervisor(
+                supervisor.feishu_open_id, text, kind="reject_need_name"
+            )
+            await self.events.record(
+                "feedback.reject_unparsed",
+                actor=Actor.SUPERVISOR,
+                object_type="message",
+                object_id=message_row.id,
+                detail={"text": inbound.text[:200], "roster": sorted(known)},
+                note="淘汰指令里没有匹配到名单内的人",
+            )
+            return FeedbackOutcome(handled=False, action="reject_need_name", reply_text=text)
+
+        rejected: list[str] = []
+        for candidate in candidates:
+            if candidate.name not in names:
+                continue
+            from_state = candidate.status
+            candidate.status = CandidateStatus.SCREENED_REJECTED
+            await self.session.flush()
+            await self.events.record(
+                "candidate.rejected",
+                actor=Actor.SUPERVISOR,
+                object_type="candidate",
+                object_id=candidate.id,
+                from_state=from_state,
+                to_state=CandidateStatus.SCREENED_REJECTED,
+                detail={"by": inbound.sender_id, "channel": inbound.channel, "text": inbound.text[:200]},
+                note="主管判定不合适，已从流程中移除（未通知候选人）",
+            )
+            rejected.append(candidate.name)
+
+        reply = (
+            f"已把 {'、'.join(rejected)} 标记为淘汰，不会再进入面试安排。\n"
+            "按项目口径，系统不会给候选人发任何淘汰通知。"
+        )
+        await self.notification.notify_supervisor(
+            supervisor.feishu_open_id, reply, kind="reject_applied"
+        )
+        await self.events.record(
+            "feedback.reject_applied",
+            actor=Actor.ROBOT,
+            object_type="message",
+            object_id=message_row.id,
+            detail={"rejected": rejected},
+            note=f"按主管指令淘汰 {len(rejected)} 人",
+        )
+        return FeedbackOutcome(
+            handled=True,
+            action="candidate_rejected",
+            detail={"rejected": rejected},
+            reply_text=reply,
+        )
+
+    def _schedule_from_plan(self, plan: AgentPlan) -> InterviewScheduleSchema | None:
+        """把路由阶段抽到的槽位转成排期结构。
+
+        时间原样交给 ``parse_chinese_datetime`` 解析（模型只负责抄原文，不换算日期）；
+        解析不出来时 ``interview_time`` 为 None，下游会追问时间而不是瞎猜。
+        """
+        if not plan.names:
+            return None
+        parsed = (
+            parse_chinese_datetime(
+                plan.time_text, now=now_local(self.settings.timezone), tz=self.settings.timezone
+            )
+            if plan.time_text
+            else None
+        )
+        return InterviewScheduleSchema(
+            candidate_names=list(plan.names),
+            interview_time=parsed,
+            location=plan.location,
+            confidence=plan.confidence or 0.6,
+            method="llm",
+            source_quotes=[
+                SourceQuote(
+                    field="candidate_names",
+                    quote=plan.time_text or "、".join(plan.names),
+                )
+            ],
         )
 
     # ------------------------------------------------------------ 场景 A：改期

@@ -189,14 +189,19 @@ class Settings(BaseSettings):
             if key in seen:
                 continue
             seen.add(key)
-            chain.append(
-                {
-                    "name": str(item.get("name") or model),
-                    "model": model,
-                    "api_base": api_base,
-                    "api_key": api_key,
-                }
-            )
+            entry: dict[str, str] = {
+                "name": str(item.get("name") or model),
+                "model": model,
+                "api_base": api_base,
+                "api_key": api_key,
+            }
+            # 思考型模型（vLLM 上的 Qwen3 等）会先把大段推理写进 reasoning，
+            # max_tokens 偏小时 content 直接是 null，JSON 抽取就会失败。
+            # 在供应商配置里写 "disable_thinking": true，本项目的 HTTP 直连路径
+            # 会带 chat_template_kwargs.enable_thinking=false 关掉它。
+            if str(item.get("disable_thinking") or "").strip().lower() in {"1", "true", "yes", "on"}:
+                entry["disable_thinking"] = "true"
+            chain.append(entry)
         return chain
 
     @property
@@ -206,8 +211,17 @@ class Settings(BaseSettings):
 
     @property
     def feishu_group_push(self) -> bool:
-        """出站是否走群机器人 webhook。"""
-        return bool(self.feishu_webhook_url) and self.feishu_push_target == "group"
+        """出站是否发到群里。
+
+        2026-11-13 修正：旧实现只认 ``FEISHU_WEBHOOK_URL``，导致「只配了
+        ``FEISHU_CHAT_ID`` + 应用凭证」的部署被判成私聊，群机器人与 Agent 问答
+        全部静默走 open_id 分支（而 open_id 往往是群 chat_id，发不出去）。
+        现在两条通道任有一条即可进群：有 chat_id 用应用身份发，
+        只有 webhook 就用自定义机器人发。
+        """
+        if self.feishu_push_target != "group":
+            return False
+        return bool((self.feishu_webhook_url or "").strip() or (self.feishu_chat_id or "").strip())
 
     @property
     def feishu_mention_list(self) -> list[str]:

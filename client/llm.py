@@ -101,6 +101,21 @@ def _parse_first_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _wants_no_thinking(provider: dict[str, str]) -> bool:
+    """供应商配置里写了 ``"disable_thinking": true`` 时，请求里关掉模型思考。
+
+    vLLM 部署的 Qwen3 默认「先长思考再给答案」：max_tokens 小时 content 为 null，
+    只能从 reasoning 里捞 JSON——而提示词里的 few-shot 示例也在 reasoning 里，
+    极易把示例当成结果（比解析失败更危险）。关掉思考后 content 直接是答案。
+    """
+    return str(provider.get("disable_thinking") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 class LLMClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -136,7 +151,7 @@ class LLMClient:
         return ordered
 
     # ------------------------------------------------------------------ 调用
-    async def _call_litellm(
+    async def _complete_raw(
         self,
         provider: dict[str, str],
         *,
@@ -144,14 +159,32 @@ class LLMClient:
         user: str,
         temperature: float,
         max_tokens: int,
-    ) -> dict[str, Any]:
-        import litellm  # 延迟导入：无 LLM 场景（规则抽取主路径）不加载该依赖
+    ) -> str:
+        """调用一次模型，返回纯文本（``content``，为空则读 ``reasoning``）。
+
+        装了 litellm 就用它；没装则回落到 httpx 直连 OpenAI 兼容接口。
+        两者对「OpenAI 协议」的端点等价，后者只依赖项目本来就有的 httpx——
+        这样离线/受限环境不必为了一个网关再装 100+ MB 依赖。
+        """
+        try:
+            import litellm  # 延迟导入：无 LLM 场景（规则抽取主路径）不加载该依赖
+        except ImportError:
+            return await self._call_http(
+                provider,
+                system=system,
+                user=user,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
 
         # litellm 默认往 stdout 打 "LiteLLM completion() model=..."，一轮 25 份简历
         # 会刷满控制台，把业务日志冲没；关掉它的调试输出（失败信息我们自己记 warning）。
         litellm.suppress_debug_info = True
         litellm.set_verbose = False
 
+        extra: dict[str, Any] = {}
+        if _wants_no_thinking(provider):
+            extra["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
         response = await litellm.acompletion(
             model=provider["model"],
             messages=[
@@ -163,39 +196,111 @@ class LLMClient:
             api_base=(provider.get("api_base") or "").rstrip("/") or None,
             api_key=provider.get("api_key") or None,
             timeout=self.settings.llm_timeout_seconds,
+            **extra,
         )
 
         try:
             message = response["choices"][0]["message"]
-            content = message["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise ExternalServiceError(
                 f"LLM 响应结构异常: {response}", code="llm_bad_response"
             ) from exc
+        return self._content_of(message)
 
-        if not content:
-            # 学院那台 vLLM 上的 qwen3.6 是「思考型」模型：max_tokens 偏小时会把整段
-            # 思考过程放进 reasoning、content 返回 null。这里读 reasoning 兜底，
-            # 后面 strip_json_fence 会从中截出 JSON；两条都空才算失败。
-            content = (
-                message.get("reasoning_content")
-                or message.get("reasoning")
-                or ""
+    async def _call_http(
+        self,
+        provider: dict[str, str],
+        *,
+        system: str,
+        user: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
+        """直接 POST ``/chat/completions``（OpenAI 兼容），litellm 缺失时的兜底。"""
+        import httpx
+
+        base = (provider.get("api_base") or "").rstrip("/")
+        if not base:
+            raise ExternalServiceError(
+                "供应商缺少 api_base，无法直连（litellm 不可用时必须提供）", code="llm_no_base"
             )
+        # litellm 的模型名带供应商前缀（openai/xxx、deepseek/xxx），直连时要去掉
+        model = (provider.get("model") or "").split("/", 1)[-1]
+        headers = {"Content-Type": "application/json"}
+        if provider.get("api_key"):
+            headers["Authorization"] = f"Bearer {provider['api_key']}"
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if _wants_no_thinking(provider):
+            # vLLM + Qwen3 支持：关掉「先思考再回答」，content 直接就是答案。
+            # 否则 reasoning 会把 max_tokens 吃光、content 返回 null，
+            # 而从 reasoning 里抽 JSON 极易抽到提示词里的示例（假结果）。
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        async with httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds) as client:
+            response = await client.post(f"{base}/chat/completions", json=payload, headers=headers)
+
+        if response.status_code >= 400:
+            raise ExternalServiceError(
+                f"LLM HTTP {response.status_code}: {response.text[:300]}", code="llm_http_error"
+            )
+        try:
+            data = response.json()
+            message = data["choices"][0]["message"]
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise ExternalServiceError(
+                f"LLM 响应结构异常: {response.text[:300]}", code="llm_bad_response"
+            ) from exc
+        return self._content_of(message)
+
+    @staticmethod
+    def _content_of(message: dict[str, Any]) -> str:
+        """从 message 里取正文；思考型模型（vLLM 上的 qwen）正文可能只在 reasoning。"""
+        content = message.get("content")
+        if not content:
+            content = message.get("reasoning_content") or message.get("reasoning") or ""
         if not content:
             raise ExternalServiceError("LLM 返回空内容", code="llm_bad_response")
+        return str(content).strip()
 
+    @staticmethod
+    def _parse_json(content: str) -> dict[str, Any]:
         try:
-            parsed = json.loads(strip_json_fence(str(content)))
+            parsed = json.loads(strip_json_fence(content))
         except json.JSONDecodeError as exc:
-            parsed = _parse_first_json_object(str(content))
+            parsed = _parse_first_json_object(content)
             if parsed is None:
                 raise ExternalServiceError(
-                    f"LLM 返回内容不是合法 JSON: {str(content)[:300]}", code="llm_bad_json"
+                    f"LLM 返回内容不是合法 JSON: {content[:300]}", code="llm_bad_json"
                 ) from exc
         if not isinstance(parsed, dict):
             raise ExternalServiceError("LLM 返回的 JSON 顶层必须是对象", code="llm_bad_json")
         return parsed
+
+    async def _call_litellm(
+        self,
+        provider: dict[str, str],
+        *,
+        system: str,
+        user: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        content = await self._complete_raw(
+            provider,
+            system=system,
+            user=user,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return self._parse_json(content)
 
     async def complete_json(
         self,
@@ -215,8 +320,91 @@ class LLMClient:
 
         last_error: Exception | None = None
         for provider in providers:
+            # 同一家最多试两次：第一次返回的 JSON 不合法时加倍 max_tokens 再来一次。
+            # 思考型模型偶尔会把预算全花在 reasoning 上，正文被截断成半个 JSON。
+            for attempt, budget in enumerate((max_tokens, max_tokens * 2), start=1):
+                try:
+                    result = await self._call_litellm(
+                        provider,
+                        system=system,
+                        user=user,
+                        temperature=temperature,
+                        max_tokens=budget,
+                    )
+                    if self.last_provider != provider["name"]:
+                        logger.info(
+                            "llm.provider_ok",
+                            extra={"provider": provider["name"], "model": provider["model"]},
+                        )
+                    self.last_provider = provider["name"]
+                    return result
+                except Exception as exc:  # noqa: BLE001 - 任何底层异常都视为「这家不可用」
+                    last_error = exc
+                    retry = getattr(exc, "code", "") == "llm_bad_json" and attempt == 1
+                    logger.warning(
+                        "llm.provider_failed",
+                        extra={
+                            "provider": provider.get("name"),
+                            "model": provider.get("model"),
+                            "attempt": attempt,
+                            "retry": retry,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        },
+                    )
+                    if not retry:
+                        break
+
+        logger.warning(
+            "llm.all_fallback_failed",
+            extra={"providers": [p["name"] for p in providers], "error": str(last_error)},
+        )
+        raise LLMUnavailable(f"LLM 全部供应商调用失败: {last_error}") from last_error
+
+    # ------------------------------------------------------------ 自由文本
+    # 2026-11-13：飞书自然语言助手需要「说人话」，不能只回 JSON。
+    # 与 complete_json 共用同一套供应商链与降级策略，只是不解析返回值。
+    async def _call_text(
+        self,
+        provider: dict[str, str],
+        *,
+        system: str,
+        user: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
+        """纯文本调用：与 ``_call_litellm`` 共用 ``_complete_raw``（含 HTTP 兜底）。"""
+        return await self._complete_raw(
+            provider,
+            system=system,
+            user=user,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+    async def complete_text(
+        self,
+        *,
+        system: str,
+        user: str,
+        temperature: float = 0.3,
+        max_tokens: int = 800,
+    ) -> str:
+        """调用模型并返回纯文本。失败抛 ``LLMUnavailable``。
+
+        用于「基于事实组织一句话」这类不需要 JSON 的场景（飞书问答）。
+        任何底层异常都会在供应商链上逐个尝试，全部失败才抛。
+        """
+        if not self.enabled:
+            raise LLMUnavailable("LLM 未启用（缺少 key 或 LLM_MODE=off）")
+
+        providers = self._candidate_providers()
+        if not providers:
+            raise LLMUnavailable("未配置任何 LLM 供应商（LLM_PROVIDERS / LLM_MODEL 均为空）")
+
+        last_error: Exception | None = None
+        for provider in providers:
             try:
-                result = await self._call_litellm(
+                text = await self._call_text(
                     provider,
                     system=system,
                     user=user,
@@ -229,7 +417,7 @@ class LLMClient:
                         extra={"provider": provider["name"], "model": provider["model"]},
                     )
                 self.last_provider = provider["name"]
-                return result
+                return text
             except Exception as exc:  # noqa: BLE001 - 任何底层异常都视为「这家不可用」
                 last_error = exc
                 logger.warning(
