@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .env
+.env.bak*
 var/
 *.db
 *.sqlite3
@@ -12,3 +13,4 @@ var/
 tests/testdata/
 audit_output/
 .workbuddy/
+.vscode/

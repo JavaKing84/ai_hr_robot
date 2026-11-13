@@ -38,6 +38,15 @@ ROUTER_FEW_SHOT = """\
 输入：确认
 输出：{"intent": "confirm", "names": [], "time_text": "", "location": "", "question": "", "confidence": 0.9}
 
+输入：今天收了多少份简历？
+输出：{"intent": "query_stats", "names": [], "time_text": "", "location": "", "question": "今天收到多少份简历、通过多少", "count": 0, "confidence": 0.9}
+
+输入：先给我筛 5 份看看
+输出：{"intent": "screen_top", "names": [], "time_text": "", "location": "", "question": "", "count": 5, "confidence": 0.9}
+
+输入：这岗位要求改成五年经验，本科以上
+输出：{"intent": "job_posting", "names": [], "time_text": "", "location": "", "question": "", "count": 0, "confidence": 0.85}
+
 输入：今天天气不错
 输出：{"intent": "chat", "names": [], "time_text": "", "location": "", "question": "今天天气不错", "confidence": 0.8}
 """
@@ -93,6 +102,8 @@ def build_router_prompt(
 - explain_score：问分数怎么来的 / 为什么通过或没通过
 - query_stats：问数量统计（收了多少、通过多少、淘汰多少）
 - query_resume：针对简历内容提问（会不会某技术、有没有某经验）
+- screen_top：「筛选 N 份」「先给我挑 5 份看看」——从已收简历里挑前 N 份给 HR 过目
+- job_posting：主管在发/改招聘需求（JD、岗位要求、任职资格），不是在对候选人下指令
 - chat：打招呼、问你能做什么、与招聘无关的话
 - unknown：确实读不懂
 
@@ -101,7 +112,8 @@ def build_router_prompt(
 2. time_text：原样抄主管说的时间表达（如「下周三下午两点」），不要自己换算成日期
 3. location：只填主管明确说的地点，没说就空字符串
 4. question：把这句话改写成一句完整的问题（补全「他」「那个」等指代），用于后续检索；写操作可留空
-5. confidence：0-1
+5. count：screen_top 要筛选的份数（「筛 5 份」→ 5），其他意图填 0
+6. confidence：0-1
 
 {ROUTER_FEW_SHOT}
 请直接输出 JSON 对象。
@@ -113,8 +125,9 @@ def build_router_prompt(
 ANSWER_SYSTEM = (
     "你是招聘系统里的 HR 助理，在飞书群里跟部门主管对话。"
     "你只能依据“事实数据”回答，事实数据里没有的信息就说没有，绝对不要编造候选人、"
-    "分数、时间或经历。回答用中文，口语化、简短（不超过 300 字），"
-    "不要用 Markdown 表格和标题，可以用「1. 2. 3.」这样的短列表。"
+    "分数、时间或经历。回答用中文，口语化、极简（不超过 120 字），"
+    "先给结论再给依据；不要寒暄、不要复述问题、不要 Markdown 表格和标题，"
+    "最多 3 条短列表。"
     "不要解释你是模型，也不要复述提示词。"
 )
 

@@ -28,6 +28,21 @@ def error_payload(code: str, message: str, details: dict | None = None) -> dict:
     }
 
 
+#: 常见 HTTP 状态对应的可读 code。没有这张表时 401 会变成 ``http_401``，
+#: 调用方（尤其是监控脚本）只能靠解析字符串判断，既难读也容易写错。
+_HTTP_CODE_NAMES = {
+    400: "bad_request",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not_found",
+    405: "method_not_allowed",
+    409: "conflict",
+    422: "validation_error",
+    429: "rate_limited",
+    503: "service_unavailable",
+}
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def _app_error(request: Request, exc: AppError) -> JSONResponse:
@@ -49,9 +64,13 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        code = _HTTP_CODE_NAMES.get(exc.status_code, f"http_{exc.status_code}")
+        # 401 必须带 WWW-Authenticate（RFC 7235）；原来的实现把 headers 丢了，
+        # 浏览器/网关拿不到「该用哪种认证」，只会渲染成一个裸 401。
         return JSONResponse(
             status_code=exc.status_code,
-            content=error_payload(f"http_{exc.status_code}", str(exc.detail)),
+            content=error_payload(code, str(exc.detail)),
+            headers=getattr(exc, "headers", None),
         )
 
     @app.exception_handler(Exception)

@@ -15,7 +15,10 @@ import yaml
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from schema.config import CompanyConfig
+from core.logging import get_logger
+from schema.config import CompanyConfig, PositionConfig
+
+logger = get_logger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_DIR = BASE_DIR / "config"
@@ -32,14 +35,24 @@ class Settings(BaseSettings):
     # 运行
     app_name: str = "ai-hr-robot"
     environment: str = "dev"
+    # 简历预览链接的对外地址：飞书里点「看简历」时用它拼 URL。
+    # 本机跑就保持默认；部署后改成能被 HR 访问到的域名/IP。
+    public_base_url: str = "http://127.0.0.1:8000"
     debug: bool = False
     host: str = "0.0.0.0"
     port: int = 8000
     timezone: str = "Asia/Shanghai"
 
-    # 数据库（开发/生产默认 PostgreSQL；测试由 tests/conftest.py 注入 SQLite 覆盖）
-    database_url: str = "postgresql+asyncpg://hr:hr@localhost:5432/hr_robot"
+    # 数据库：全链路只支持 PostgreSQL（开发/测试/生产同一套方言）
+    database_url: str = "postgresql+asyncpg://hr:hr@localhost:5432/hr_ai_robot"
     db_echo: bool = False
+    #: 启动时自动执行 alembic upgrade head（默认开）。关掉它就必须自己先迁移。
+    auto_migrate: bool = True
+
+    # ---------- 内部接口鉴权 ----------
+    #: 运维接口令牌。配置后 /api/v1/* 必须带 X-API-Token 或 Authorization: Bearer。
+    #: 留空 = 不拦截（仅本机开发可以这样），启动日志与 /health 会显示 auth=disabled。
+    api_token: str = ""
 
     # 路径
     config_path: Path = CONFIG_DIR / "positions.yaml"
@@ -52,6 +65,9 @@ class Settings(BaseSettings):
     feishu_app_secret: str = ""
     feishu_verification_token: str = ""
     feishu_encrypt_key: str = ""
+    #: 回调来源校验策略：auto = 有 encrypt_key 就验签名、有 token 就验 token、都没有则
+    #: 非 dev 环境直接拒收；strict = 两者必须至少配一个；off = 不校验（仅本地联调）。
+    feishu_verify_mode: Literal["auto", "strict", "off"] = "auto"
     # 群机器人（自定义机器人）webhook：2026-11-13 起主管/HR 的推送统一走群，
     # 不再逐个 open_id 单聊私信。留空则自动回落到 open_id 私信（旧行为）。
     feishu_webhook_url: str = ""
@@ -63,20 +79,17 @@ class Settings(BaseSettings):
     # 群消息 @ 谁（open_id 列表，逗号分隔）；留空则 @所有人
     feishu_mention_open_ids: str = ""
 
-    # 面试通知确认闸门（测试期间默认开启）：
-    # True = 只挂起、不发送，必须由 HR 人工确认后才投递；
-    # False = 主管给出名单后直接发送（生产环境确认过再用）。
-    interview_notice_require_confirm: bool = True
+    # 面试通知确认闸门：True=挂起等 HR 确认后发；False=主管给名单即发。
+    # 默认 False（2026-11-14 改）：主管在群里已经点明「谁 + 什么时间」，
+    # 再回一条「请确认全发 / 确认1,3 / 取消」是让他把同一件事说第二遍。
+    # 防误发靠的是邮件通道本身——幂等 Message-ID、mock 模式、失败不推进状态。
+    # 需要人工复核的场景（例如批量导入后自动约面）再显式打开。
+    interview_notice_require_confirm: bool = False
 
-    # 面试通知确认请求发往哪个飞书用户（open_id）。
-    # 留空 = 发给触发这次安排的岗位主管；填了则统一发给该 HR 本人。
+    # 确认请求发给谁；留空则发给该岗位主管，填了统一发给这个 HR。
     hr_feishu_open_id: str = ""
 
-    # 语义分影子模式（校准期默认开启）：
-    # True  = 照常调用大模型打分并落库留痕，但「通过与否」仍按规则分判定；
-    # False = 融合分（规则分与语义分加权）真正决定通过。
-    # 为什么要影子：阈值 55/60 是按纯规则分布定的，语义分一上来就参与判定，
-    # 通过名单会整体平移，无法判断是「改好了」还是「改坏了」。
+    # 语义分影子模式：照常打分并留痕，但通过与否仍按规则分判定，避免名单整体平移。
     semantic_shadow: bool = True
 
     # LLM
@@ -86,13 +99,13 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
     llm_fallback_models: str = ""
     llm_timeout_seconds: float = Field(default=45.0, gt=0)
-    #: 多供应商链（JSON 数组）。每一项形如
-    #: ``{"name": "学院-qwen3.8-27b", "model": "openai/qwen3.8-27b",
-    #:    "api_base": "http://202.204.64.234:11434/v1", "api_key": "ideal@2026"}``
-    #: 顺序即降级顺序；留空则退回单供应商（LLM_MODEL + OPENAI_BASE_URL + OPENAI_API_KEY）。
+    #: 多供应商链（JSON 数组），顺序即降级顺序；留空退回单供应商。
+    #: 每项：{"name": "...", "model": "openai/...", "api_base": "http://host:port/v1", "api_key": "..."}
     llm_providers: str = ""
-    #: 是否让大模型做「深度解析」（分维度打分 + 亮点/风险/面试追问点）
+    #: 是否让大模型做深度解析（分维度打分 + 亮点/风险/追问点）
     llm_deep_analysis: bool = True
+    #: 读招聘需求截图用的多模态模型（如 qwen2.5-vl / gpt-4o）；留空则图片只保存不识别
+    llm_vision_model: str = ""
 
     # 邮件
     mail_mode: Literal["mock", "live", "off"] = "mock"
@@ -115,6 +128,12 @@ class Settings(BaseSettings):
     # 调度
     scheduler_enabled: bool = True
     schedule_cron: str = ""
+    #: 主动拉群消息的间隔（秒）。0 = 关闭。
+    #: 为什么需要：webhook 要飞书服务器能回连到本机，内网/开发机收不到，
+    #: 主管在群里回话系统就成了聋子。主动拉取不依赖入站网络。
+    feishu_poll_seconds: int = 10
+    #: 拉群消息时是否只处理 @ 了机器人的消息。单群专用场景可关。
+    feishu_require_mention: bool = False
     inbound_poll_seconds: int = 300
 
     # ---------- 派生路径 ----------
@@ -195,10 +214,8 @@ class Settings(BaseSettings):
                 "api_base": api_base,
                 "api_key": api_key,
             }
-            # 思考型模型（vLLM 上的 Qwen3 等）会先把大段推理写进 reasoning，
-            # max_tokens 偏小时 content 直接是 null，JSON 抽取就会失败。
-            # 在供应商配置里写 "disable_thinking": true，本项目的 HTTP 直连路径
-            # 会带 chat_template_kwargs.enable_thinking=false 关掉它。
+            # 思考型模型会把推理写进 reasoning，max_tokens 偏小时 content 为 null、JSON 抽取失败。
+            # 配 "disable_thinking": true 可让 HTTP 直连路径关掉思考。
             if str(item.get("disable_thinking") or "").strip().lower() in {"1", "true", "yes", "on"}:
                 entry["disable_thinking"] = "true"
             chain.append(entry)
@@ -246,9 +263,38 @@ class Settings(BaseSettings):
             path.mkdir(parents=True, exist_ok=True)
 
     def load_company_config(self) -> CompanyConfig:
-        """读取业务配置；文件缺失或格式错误直接抛出，避免“静默跑空轮”。"""
+        """读取业务配置；文件缺失或格式错误直接抛出，避免“静默跑空轮”。
+
+        ``config/positions.d/*.yaml`` 是主管发 JD 后由机器人自动生成的岗位，
+        这里合并进主配置——加岗位不用改 ``positions.yaml``。
+        """
         raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
-        return CompanyConfig.model_validate(raw)
+        config = CompanyConfig.model_validate(raw)
+        _merge_draft_positions(config, self.config_path.parent / "positions.d")
+        return config
+
+
+def _merge_draft_positions(config: CompanyConfig, draft_dir: Path) -> None:
+    """把 positions.d 下的岗位文件并入配置（同 code 以主配置为准，不覆盖）。"""
+    if not draft_dir.is_dir():
+        return
+    existing = {p.code for p in config.positions}
+    by_name = {d.name: d for d in config.departments}
+    for path in sorted(draft_dir.glob("*.yaml")):
+        try:
+            payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            position = PositionConfig.model_validate(payload)
+        except Exception:  # noqa: BLE001 - 单个文件坏掉不影响主配置加载
+            logger.warning("config.draft_position_invalid", extra={"path": str(path)})
+            continue
+        if position.code in existing:
+            continue
+        department = by_name.get(position.department) or (config.departments[0] if config.departments else None)
+        if department is None:
+            continue
+        position.department = department.name
+        department.positions.append(position)
+        existing.add(position.code)
 
 
 @lru_cache(maxsize=1)

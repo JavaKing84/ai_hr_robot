@@ -65,12 +65,16 @@ class EmailThreadRepository(BaseRepository[EmailThread]):
         return result.scalars().first()
 
     async def find_by_any_message_id(self, message_ids: Sequence[str]) -> EmailThread | None:
-        """按 In-Reply-To / References 里的任意 Message-ID 命中所属线程。"""
+        """按 In-Reply-To / References 里的任意 Message-ID 命中所属线程。
+
+        2026-11-14：改用 jsonb 包含查询（``message_ids @> '["<id>"]'``）配合 GIN 索引，
+        不再用 ``LIKE '%<id>%'``——后者前导通配符用不上索引，每条回信都要全表扫一遍。
+        """
         cleaned = [mid for mid in message_ids if mid]
         if not cleaned:
             return None
         conditions = [EmailThread.root_message_id.in_(cleaned)]
-        conditions += [EmailThread.message_id_index.like(f"%{mid}%") for mid in cleaned]
+        conditions += [EmailThread.message_ids.contains([mid]) for mid in cleaned]
         result = await self.session.execute(
             select(EmailThread).where(or_(*conditions)).order_by(EmailThread.id.desc()).limit(1)
         )

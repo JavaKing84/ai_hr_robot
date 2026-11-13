@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from client.feishu import FeishuClient
 from client.mailbox import InboundEmail, MailboxClient
 from client.resume_parser import ParsedResume, ResumeParser, normalize_text
-from config.settings import Settings
+from config.settings import BASE_DIR, Settings
 from core.logging import get_logger, log_extra
 from core.safe_process import run_in_subprocess
 from core.timeparse import now_utc_naive
@@ -183,6 +184,7 @@ class IngestionService:
     ) -> IngestOutcome:
         """核心入库流程（两个入口共用）。"""
         parsed = prefetched or await self._parse_resume_safely(data, filename)
+        sha256, size = _file_meta(parsed, data)
 
         active_positions = await self.positions.list_active()
         # 抽取放在归位判断之前：无论能否归位都要抽姓名/联系方式，未归位时仍要留档。
@@ -259,9 +261,12 @@ class IngestionService:
             project_highlights=list(extracted.project_highlights or []),
             summary=extracted.summary,
             structured=extracted.model_dump(mode="json"),
-            resume_path=parsed.path,
+            resume_path=_resume_rel_path(parsed),
             resume_filename=parsed.filename,
             resume_text=parsed.text[:50_000],
+            resume_sha256=sha256,
+            resume_size_bytes=size,
+            parse_engine=parsed.engine,
             source=source,
             status=CandidateStatus.RECEIVED,
             first_seen_at=now,
@@ -377,6 +382,7 @@ class IngestionService:
         仅将未归位者停留在 received 状态并留痕。
         """
         now = now_utc_naive()
+        sha256, size = _file_meta(parsed)
         candidate = Candidate(
             name=extracted.name or _fallback_name(parsed.filename, extracted.email),
             email=extracted.email,
@@ -392,9 +398,12 @@ class IngestionService:
             project_highlights=list(extracted.project_highlights or []),
             summary=extracted.summary,
             structured=extracted.model_dump(mode="json"),
-            resume_path=parsed.path,
+            resume_path=_resume_rel_path(parsed),
             resume_filename=parsed.filename,
             resume_text=parsed.text[:50_000],
+            resume_sha256=sha256,
+            resume_size_bytes=size,
+            parse_engine=parsed.engine,
             source=source,
             status=CandidateStatus.RECEIVED,
             first_seen_at=now,
@@ -588,6 +597,24 @@ def _fallback_name(filename: str, email: str) -> str:
     if stem and len(stem) <= 20:
         return stem
     return email.split("@")[0] if email else "未命名候选人"
+
+
+def _resume_rel_path(parsed: ParsedResume) -> str:
+    """落盘绝对路径 → 仓库相对路径（var/resumes/xxx）。项目目录搬家后记录仍然有效。"""
+    try:
+        return Path(parsed.path).resolve().relative_to(BASE_DIR).as_posix()
+    except (ValueError, OSError):
+        return Path(parsed.path).name
+
+
+def _file_meta(parsed: ParsedResume, data: bytes | None = None) -> tuple[str, int]:
+    """返回 (sha256, 字节数)。优先用内存里的原始字节，避免二次读盘。"""
+    if data is None:
+        try:
+            data = Path(parsed.path).read_bytes()
+        except OSError:
+            return "", 0
+    return hashlib.sha256(data).hexdigest(), len(data)
 
 
 def build_search_summary(candidates: Sequence[Candidate]) -> dict[str, int]:

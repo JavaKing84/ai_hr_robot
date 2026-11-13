@@ -243,10 +243,7 @@ class MailboxClient:
         logger.info("mail.mock.polled", extra=log_extra(count=len(results)))
         return results
 
-    #: RFC 2971 的客户端身份声明。**网易系邮箱（163/126/yeah.net/企业邮）在 SELECT
-    #: 之前强制要求这条命令**，否则返回
-    #: ``SELECT Unsafe Login. Please contact kefu@188.com for help``。
-    #: 其他服务器不支持时回 BAD，忽略即可，不影响后续命令。
+    #: RFC 2971 客户端身份声明：网易系邮箱 SELECT 前强制要求，否则报 Unsafe Login。
     _IMAP_ID_ARGS = '("name" "ai-hr-robot" "version" "1.0" "vendor" "ai-hr")'
 
     @classmethod

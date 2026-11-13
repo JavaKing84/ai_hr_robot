@@ -4,7 +4,7 @@
 - ``build_services``：请求/任务级，绑定一个 AsyncSession，构造各用例服务；
 - ``get_db`` / ``get_services``：FastAPI 依赖注入入口。
 
-服务之间只通过构造参数协作，没有全局可变状态，测试可以直接用内存 SQLite 构造一套。
+服务之间只通过构造参数协作，没有全局可变状态，测试可以注入一个测试库构造一套。
 """
 
 from __future__ import annotations
@@ -24,6 +24,10 @@ from core.db import build_engine, build_session_factory
 from core.exceptions import ConfigurationError
 from core.logging import get_logger, log_extra
 from core.timeparse import now_utc_naive
+from repository.candidate import CandidateRepository
+from repository.event import EventRepository
+from repository.message import MessageRepository
+from repository.position import PositionRepository
 from schema.config import CompanyConfig
 from service.email_threading import EmailThreadService
 from service.extraction import ExtractionService
@@ -116,6 +120,11 @@ class Services:
     feedback: FeedbackService
     inbound: InboundEmailService
     orchestrator: Orchestrator
+    #: 接口层直接查留痕用的只读仓库（避免为了一个查询再包一层 service）
+    messages: MessageRepository
+    events: EventRepository
+    candidates: CandidateRepository
+    positions: PositionRepository
 
 
 def build_services(session: AsyncSession, container: Container | None = None) -> Services:
@@ -187,6 +196,10 @@ def build_services(session: AsyncSession, container: Container | None = None) ->
         feedback=feedback,
         inbound=inbound,
         orchestrator=orchestrator,
+        messages=MessageRepository(session),
+        events=EventRepository(session),
+        candidates=CandidateRepository(session),
+        positions=PositionRepository(session),
     )
 
 

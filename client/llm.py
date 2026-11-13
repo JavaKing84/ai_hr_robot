@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -27,8 +28,7 @@ from config.settings import Settings
 from core.exceptions import ExternalServiceError, LLMUnavailable
 from core.logging import get_logger
 
-# litellm 冷启动会去 GitHub 拉「模型价格表」，国内直连必然超时（实测 3 次重试 ~10s），
-# 而且它默认把 "LiteLLM completion() model=..." 打到 stdout，25 份简历就刷满屏。
+# litellm 冷启动会去 GitHub 拉价格表（国内必超时），且默认把调用日志打到 stdout。
 # 这两行必须在 import litellm 之前生效。
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 os.environ.setdefault("LITELLM_LOG", "ERROR")
@@ -380,6 +380,50 @@ class LLMClient:
             temperature=temperature,
             max_tokens=max_tokens,
         )
+
+    async def complete_vision(
+        self,
+        *,
+        image_bytes: bytes,
+        system: str,
+        user: str,
+        mime: str = "image/png",
+        max_tokens: int = 1200,
+    ) -> str:
+        """让多模态模型读一张图（招聘需求截图）。未配置 ``LLM_VISION_MODEL`` 时直接抛。"""
+        model = (self.settings.llm_vision_model or "").strip()
+        if not model:
+            raise LLMUnavailable("未配置 LLM_VISION_MODEL，图片识别不可用")
+        import base64
+
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        messages = [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+                ],
+            },
+        ]
+        kwargs: dict[str, Any] = {"model": model, "messages": messages, "max_tokens": max_tokens}
+        provider = next(iter(self.settings.llm_provider_chain), {})
+        if provider.get("api_base"):
+            kwargs["api_base"] = provider["api_base"]
+        if provider.get("api_key"):
+            kwargs["api_key"] = provider["api_key"]
+
+        def _call() -> str:
+            import litellm
+
+            response = litellm.completion(**kwargs)
+            return (response.choices[0].message.content or "").strip()
+
+        try:
+            return await asyncio.to_thread(_call)
+        except Exception as exc:  # noqa: BLE001
+            raise LLMUnavailable(f"图片识别失败：{type(exc).__name__}: {exc}") from exc
 
     async def complete_text(
         self,

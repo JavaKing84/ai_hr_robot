@@ -34,10 +34,8 @@ NOW = datetime(2026, 11, 3, 15, 53, tzinfo=TZ)
 ROSTER = ["张明", "张三", "李四", "王小明", "赵敏", "刘洋", "陈静", "周涛", "孙强"]
 
 # ----------------------------------------------------------------- 人工标注评估集
-# kind: "interview"（主管安排）/ "reply"（候选人回信）
-# expected_names / expected_time：interview 的字段级真值
-# expected_intent / expected_proposed：reply 的字段级真值
-# grade_time=False：该样本时间客观上无法唯一标注，不计入时间分项分母（但仍计入姓名/意图）
+# kind: interview(主管安排) / reply(候选人回信)；expected_* 为字段级真值。
+# grade_time=False：该样本时间无法唯一标注，不计入时间分项分母。
 EVAL_CASES: list[dict] = [
     # ---- 主管面试安排（含乱序 / 含糊 / 夹杂噪声 / 接地排除 / 规则弱项）----
     dict(kind="interview", note="常规",

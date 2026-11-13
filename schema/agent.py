@@ -23,6 +23,8 @@ class AgentIntent(StrEnum):
     CONFIRM = "confirm"            # 确认发送挂起的面试通知
     CANCEL = "cancel"              # 取消挂起的面试通知
     REJECT = "reject"              # 淘汰某个候选人（只改状态，不发感谢信）
+    SCREEN_TOP = "screen_top"      # 从今天收到的简历里挑出前 N 份（带简历链接）
+    JOB_POSTING = "job_posting"    # 主管发来招聘需求文本/截图，解析成岗位配置
 
     # ---- 读操作：检索真实数据后由模型组织语言 ----
     QUERY_CANDIDATES = "query_candidates"  # 有哪些候选人 / 名单
@@ -41,6 +43,8 @@ WRITE_INTENTS: frozenset[AgentIntent] = frozenset(
         AgentIntent.CONFIRM,
         AgentIntent.CANCEL,
         AgentIntent.REJECT,
+        AgentIntent.SCREEN_TOP,
+        AgentIntent.JOB_POSTING,
     }
 )
 
@@ -85,6 +89,18 @@ _INTENT_ALIASES: dict[str, AgentIntent] = {
     "淘汰": AgentIntent.REJECT,
     "不合适": AgentIntent.REJECT,
     "不通过": AgentIntent.REJECT,
+    # 筛选前 N 份
+    "screen_top": AgentIntent.SCREEN_TOP,
+    "screen": AgentIntent.SCREEN_TOP,
+    "筛选": AgentIntent.SCREEN_TOP,
+    "挑简历": AgentIntent.SCREEN_TOP,
+    "筛几份": AgentIntent.SCREEN_TOP,
+    # 招聘需求接入
+    "job_posting": AgentIntent.JOB_POSTING,
+    "jd": AgentIntent.JOB_POSTING,
+    "recruitment_request": AgentIntent.JOB_POSTING,
+    "招聘需求": AgentIntent.JOB_POSTING,
+    "岗位要求": AgentIntent.JOB_POSTING,
     # 查询
     "query_candidates": AgentIntent.QUERY_CANDIDATES,
     "list_candidates": AgentIntent.QUERY_CANDIDATES,
@@ -150,6 +166,8 @@ class AgentPlan(BaseModel):
     location: str = ""
     #: 读操作时用于检索的问题改写（把「他」「那个」替换成具体对象）
     question: str = ""
+    #: screen_top 专用：「筛选 5 份」里的 5；0 表示没说数量
+    count: int = Field(default=0, ge=0)
     reason: str = ""
     confidence: float = Field(default=0.0, ge=0, le=1)
     method: Literal["llm", "rule"] = "rule"

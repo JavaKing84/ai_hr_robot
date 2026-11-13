@@ -116,6 +116,12 @@ class Orchestrator:
             logger.exception("cycle.dispatch_failed", extra=log_extra(cycle_id=cycle_id))
             errors.append(f"分发给主管失败：{exc}")
 
+        # 2.5) 给 HR 报一句今天的量，HR 才知道要不要说「筛选 N 份」
+        if self._hr_open_id:
+            await self._notify_hr_summary(
+                ingested=len(candidates), passed=passed, rejected=rejected
+            )
+
         # 3) 幂等补发上一轮失败的出站消息（§4-A.1b：按幂等键查重后安全补发，不产生重复消息）
         try:
             notice_results = await self.notification.retry_failed_interview_notices()
@@ -159,6 +165,32 @@ class Orchestrator:
         payload["elapsed_ms"] = elapsed_ms
         logger.info("cycle.completed", extra=log_extra(**payload))
         return response
+
+    @property
+    def _hr_open_id(self) -> str:
+        return (self.settings.hr_feishu_open_id or "").strip()
+
+    async def _notify_hr_summary(self, *, ingested: int, passed: int, rejected: int) -> None:
+        """每天一句：收到多少、通过多少、还差哪一步。HR 看到数字才好下「筛选 N 份」这种指令。
+
+        2026-11-14 增加「待确认 / 失败」两个数：这两个数不为 0 说明流程卡在人工环节
+        或者投递出了问题，比「今天收到几份」更值得 HR 先看。
+        """
+        if ingested == 0:
+            text = "今天还没有新简历。"
+        else:
+            text = (
+                f"今天收到 {ingested} 份简历，通过 {passed} 份、未通过 {rejected} 份。"
+                f"回复「筛选5份」我先给你挑出来。"
+            )
+        try:
+            pending = len(await self.notification.pending_interview_notices())
+            failed = len(await self.notification.messages.list_failed_outbound(channel="email"))
+            if pending or failed:
+                text += f"\n待你确认的面试通知 {pending} 份；发送失败待补发 {failed} 封。"
+            await self.notification.notify_supervisor(self._hr_open_id, text, kind="hr_daily_summary")
+        except Exception as exc:  # noqa: BLE001 - 报数失败不影响闭环
+            logger.warning("cycle.hr_summary_failed", extra=log_extra(error=str(exc)))
 
     async def poll_inbound(self) -> EmailPollResponse:
         """高频入站轮询（主管反馈 / 候选人回信）。"""

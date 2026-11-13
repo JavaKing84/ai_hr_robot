@@ -5,11 +5,16 @@
 
 from __future__ import annotations
 
+from html import escape
+
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse
 
 from core.deps import Services, get_services
+from core.paths import resolve_resume_path
+from core.security import require_api_token
 from core.exceptions import NotFoundError, ValidationFailed
-from model.candidate import Candidate
+from model.candidate import Candidate, CandidateStatus
 from repository.candidate import CandidateRepository
 from repository.event import EventRepository
 from repository.message import MessageRepository
@@ -24,8 +29,14 @@ from schema.candidate import (
     PositionRead,
     RunCycleResponse,
 )
+from service.reporting import ReportingService
 
-router = APIRouter(prefix="/recruitment", tags=["recruitment"])
+router = APIRouter(
+    prefix="/recruitment",
+    tags=["recruitment"],
+    # 运维接口统一鉴权：配了 API_TOKEN 就必须带令牌（见 core/security.py）
+    dependencies=[Depends(require_api_token)],
+)
 
 
 @router.post("/run", response_model=RunCycleResponse, summary="手动触发一轮完整闭环")
@@ -113,6 +124,73 @@ async def candidate_events(
     ]
 
 
+@router.get(
+    "/candidates/{candidate_id}/resume",
+    summary="简历预览（飞书里点开就能看）",
+    response_class=HTMLResponse,
+    response_model=None,
+)
+async def preview_resume(
+    candidate_id: int,
+    download: bool = Query(default=False, description="true = 下载原件；默认在线看"),
+    services: Services = Depends(get_services),
+) -> HTMLResponse | FileResponse:
+    """HR 在飞书里点「查看简历」打开的页面。
+
+    有原件（pdf/docx）就优先给原件：pdf 浏览器直接渲染，其余按附件下载；
+    原件丢失（历史上项目目录搬过家）时，用库里的 ``resume_text`` 渲染成可读页面。
+    """
+    candidate = await services.session.get(Candidate, candidate_id)
+    if candidate is None:
+        raise NotFoundError(f"候选人 {candidate_id} 不存在")
+
+    path = resolve_resume_path(candidate.resume_path)
+    exists = bool(path and path.exists())
+    if path and exists and (download or path.suffix.lower() == ".pdf"):
+        return FileResponse(
+            path,
+            filename=candidate.resume_filename or path.name,
+            media_type="application/pdf" if path.suffix.lower() == ".pdf" else "application/octet-stream",
+        )
+    return HTMLResponse(_resume_html(candidate, exists))
+
+
+def _resume_html(candidate: Candidate, has_file: bool) -> str:
+    """把结构化抽取结果 + 简历正文渲染成一页（无外部静态资源，单文件即可打开）。"""
+    def row(label: str, value: object) -> str:
+        text = str(value or "").strip()
+        return f"<tr><th>{escape(label)}</th><td>{escape(text) or '—'}</td></tr>" if text or label else ""
+
+    skills = "、".join(candidate.skills or []) or "—"
+    highlights = "；".join(candidate.project_highlights or []) or "—"
+    body = (candidate.resume_text or "").strip() or "（这份简历没有正文：原件不在磁盘上，且入库时未保存文本）"
+    note = "" if has_file else "<p class=warn>原件不在磁盘上，下面是入库时保存的纯文本。</p>"
+    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{escape(candidate.name or '候选人')} 的简历</title>
+<style>
+body{{margin:0;background:#f6f7f9;color:#1f2329;font:16px/1.7 -apple-system,"Microsoft YaHei",sans-serif}}
+main{{max-width:820px;margin:0 auto;padding:24px 18px 60px}}
+h1{{font-size:22px;margin:0 0 4px}} .sub{{color:#646a73;font-size:14px;margin-bottom:18px}}
+table{{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;overflow:hidden;margin-bottom:18px}}
+th,td{{text-align:left;padding:9px 14px;border-bottom:1px solid #eef0f3;font-size:14px;vertical-align:top}}
+th{{width:96px;color:#646a73;font-weight:500;background:#fafbfc}}
+pre{{white-space:pre-wrap;word-break:break-word;background:#fff;border-radius:10px;padding:16px 18px;font:14px/1.8 ui-monospace,Consolas,monospace;margin:0}}
+.warn{{background:#fff7e6;border:1px solid #ffd8a8;color:#ad6800;padding:8px 12px;border-radius:8px;font-size:13px}}
+</style></head><body><main>
+<h1>{escape(candidate.name or '未命名候选人')}</h1>
+<div class="sub">{escape(candidate.position_code or '未归位')}　综合分 {round(candidate.score or 0, 1)}　{escape(CandidateStatus.LABELS.get(candidate.status, candidate.status))}</div>
+{note}
+<table>
+{row("邮箱", candidate.email)}{row("电话", candidate.phone)}{row("学历", candidate.education_level)}
+{row("院校", candidate.school)}{row("专业", candidate.major)}{row("年限", candidate.years_experience)}
+{row("技能", skills)}{row("项目", highlights)}{row("摘要", candidate.summary)}
+{row("原件", candidate.resume_filename or "（无）")}
+</table>
+<pre>{escape(body)}</pre>
+</main></body></html>"""
+
+
 @router.get("/events", response_model=list[EventRead], summary="最近事件（全局留痕）")
 async def recent_events(
     limit: int = Query(100, ge=1, le=500),
@@ -186,6 +264,25 @@ async def list_positions(services: Services = Depends(get_services)) -> list[Pos
         )
         for position in positions
     ]
+
+
+@router.get("/stats", summary="运营漏斗（只读，最近 N 天）")
+async def funnel_stats(
+    days: int = Query(7, ge=1, le=90, description="统计最近多少天"),
+    daily: bool = Query(False, description="是否带上按天明细"),
+    services: Services = Depends(get_services),
+) -> dict:
+    """给主管/HR 看的数字：现在每个人停在哪一步（stage_snapshot），以及每天的流水（daily）。
+
+    之前想知道「这周过筛率」只能自己写 SQL——现在一个 GET 就有，且只读不越界。
+    """
+    reporting = ReportingService(
+        services.session, timezone=services.container.settings.timezone
+    )
+    payload = (await reporting.funnel(days=days)).as_dict()
+    if daily:
+        payload["daily"] = await reporting.daily_counts(days=days)
+    return payload
 
 
 def _ingest_response(outcome) -> IngestResponse:

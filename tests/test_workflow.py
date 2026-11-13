@@ -77,15 +77,14 @@ async def test_cycle_screens_and_dispatches(client, cycle, settings) -> None:
     assert Path(package["package_path"]).exists()
     assert Path(package["package_path"]).suffix == ".zip"
 
-    # 飞书通知文案对齐截图验收样例
+    # 飞书通知：一句话说清「收到几份、通过几份」，其余是名单
     messages = (
         await client.get("/api/v1/recruitment/messages", params={"channel": "feishu", "direction": "outbound"})
     ).json()
-    dispatch_text = next(m["body"] for m in messages if "本次贵部门面试岗位" in m["body"])
+    dispatch_text = next(m["body"] for m in messages if "收到 3 份" in m["body"])
     assert dispatch_text.startswith("张总")
-    assert "共收到 3 份简历" in dispatch_text
-    assert "符合条件的简历为 2 份" in dispatch_text
-    assert "已经发送到您邮箱" in dispatch_text
+    assert "通过 2 份" in dispatch_text
+    assert "已发您邮箱" in dispatch_text
 
     # 主管邮箱收到简历包副本（这条路径支撑“在原邮件上回复”）
     outbox = read_outbox(settings)
@@ -128,7 +127,10 @@ async def test_supervisor_reply_triggers_interview_emails(client, cycle, setting
     messages = (
         await client.get("/api/v1/recruitment/messages", params={"channel": "feishu", "direction": "outbound"})
     ).json()
-    assert any("已按您的安排通知" in m["body"] for m in messages)
+    # 2026-11-14 起回执合并成一条汇总（谁 + 各自时间 + 地点），
+    # 不再按岗位发多条「已通知 N 人」，也不再追加「请确认」二次询问。
+    assert any("已按您的话安排 2 人面试" in m["body"] for m in messages)
+    assert not any("待确认" in m["body"] for m in messages), "闸门默认关闭后不该再问一遍确认"
 
 
 async def test_candidate_reschedule_and_supervisor_approval(client, cycle, settings) -> None:

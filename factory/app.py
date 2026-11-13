@@ -63,6 +63,11 @@ def create_app(settings: Settings | None = None, container: Container | None = N
                 "llm_enabled": current.settings.llm_enabled,
                 "company": current.company_config.company.name,
                 "positions": len(current.company_config.positions),
+                # 「有没有鉴权」必须在健康检查里看得见：disabled 就是生产风险
+                "auth": "enabled" if (current.settings.api_token or "").strip() else "disabled",
+                "inbound_poll_seconds": current.settings.inbound_poll_seconds,
+                # 库有没有升到最新版，交接时光看版本号就能判断，不用登库查
+                "schema_revision": getattr(app.state, "schema_revision", "") or "unknown",
                 "config_error": current.config_error,
             },
         )

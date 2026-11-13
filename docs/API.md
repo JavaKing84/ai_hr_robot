@@ -14,6 +14,20 @@
 | 飞书回调 | `/api/v1/feishu` | `api/v1/feishu.py` |
 | 邮件 | `/api/v1/email` | `api/v1/email.py` |
 | 运维 | `/health` | `factory/app.py` |
+| 运营视图 | `/api/v1/ops` | `api/v1/ops.py` |
+
+**鉴权（2026-11-14 起）**：除 `GET /health` 与 `POST /api/v1/feishu/webhook` 外，
+`/api/v1/*` 全部要求令牌，两种写法等价：
+
+```bash
+curl -H "X-API-Token: $API_TOKEN"  ...
+curl -H "Authorization: Bearer $API_TOKEN"  ...
+```
+
+不带令牌 → `401 unauthorized`。令牌在 `.env` 的 `API_TOKEN`；留空时服务仍能起，
+但只在 `ENVIRONMENT=dev` 下放行，并在启动日志打 `security.api_token_missing`。
+飞书回调不走这个令牌，它靠 `X-Lark-Signature`（`sha256(timestamp+nonce+encrypt_key+body)`）
+加 `verification_token` 校验，两者至少满足一种；生产环境（非 dev）两者都没配时**一律拒收**。
 
 ---
 
@@ -387,26 +401,107 @@ curl "http://127.0.0.1:8000/api/v1/recruitment/messages?channel=email&direction=
   "time": "2026-11-12T09:00:00+08:00",
   "scheduler_running": true,
   "components": {
-    "database": "sqlite+aiosqlite",
+    "database": "postgresql+asyncpg",
     "feishu_mode": "mock",
     "mail_mode": "mock",
     "llm_enabled": false,
     "company": "星野科技（测试公司）",
-    "positions": 4,
+    "positions": 5,
+    "auth": "enabled",
+    "inbound_poll_seconds": 300,
+    "schema_revision": "0004_message_lookup",
     "config_error": ""
   }
 }
 ```
 
+- `auth`：`enabled` = 配了 `API_TOKEN`；`disabled` = 没配（仅 dev 放行）。
+- `inbound_poll_seconds`：入站轮询间隔；`0` 表示关闭定时拉信（只收 webhook/手动触发）。
+  改这个值要重启服务，运行期不生效。
+- `schema_revision`：库当前处在哪个迁移版本。比对这个值与 `alembic heads` 就知道
+  要不要升级；`unknown` 表示读不到（库没起 / 没有 `alembic_version` 表）。
+  迁移失败时服务仍会起来，这里会停在旧版本号上，不会假装成功。
+
 `status=degraded` 表示 `positions.yaml` 读取/校验失败（`config_error` 有原因），服务还活着但业务跑不了。
 
 ---
 
-## 五、错误码
+## 五、运营视图
+
+> 产品明确「不做管理后台」，所以这三个接口只输出**只读**数据，给运维、日报、监控用。
+> 三个都要求令牌。
+
+### 15. 招聘漏斗
+
+`GET /api/v1/recruitment/stats?days=30&daily=true`
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `days` | 30 | 统计窗口，按候选人 `created_at` 落在最近 N 天 |
+| `daily` | false | 是否附上按天流水（`received` / `passed` / `rejected`） |
+
+```json
+{
+  "since": "2026-10-14T20:23:15",
+  "until": "2026-11-13T20:23:15",
+  "stage_snapshot": {
+    "interview_notified": 4,
+    "supervisor_feedback": 1,
+    "screened_rejected": 17,
+    "dispatched": 2
+  },
+  "by_position": [
+    {"position_code": "python_developer", "interview_notified": 3, "screened_rejected": 15}
+  ],
+  "outbound": {"feishu.sent": 9, "email.sent": 7},
+  "pending_approval": 0,
+  "duplicates_in_window": 0,
+  "daily": [{"day": "2026-11-12", "received": 24, "passed": 7, "rejected": 17}]
+}
+```
+
+口径说明（这几个词很容易被理解错）：
+
+- `stage_snapshot` 是**当前状态分布**，不是历史累计；`is_duplicate=true` 的重复投递**不计入**，
+  否则「同一人投了 3 次」会把过筛率算低。
+- `by_position` 只列有数据的职位，不补零。
+- `outbound` 只统计 `sent` / `mocked`，失败的不算「发了」。
+- `since` / `until` 是 **UTC naive**（与库内一致），展示给 HR 时按 `TIMEZONE` 转换。
+
+`GET /api/v1/ops/funnel` 是同口径的短窗口版（默认 7 天），字段名一致，省得每次传参。
+
+### 16. Prometheus 指标
+
+`GET /api/v1/ops/metrics?days=30`
+
+返回 `text/plain`（Prometheus exposition format），可直接接 `prometheus.yml` 的 `scrape_configs`：
+
+```text
+# HELP hr_candidates_total 各状态候选人总数
+# TYPE hr_candidates_total gauge
+hr_candidates_total{status="screened_rejected"} 17
+# HELP hr_messages_total 各渠道/方向/状态的留痕条数
+# TYPE hr_messages_total counter
+hr_messages_total{channel="email",direction="inbound",status="received"} 40
+# HELP hr_pending_approval 待 HR 确认的面试通知数
+# TYPE hr_pending_approval gauge
+hr_pending_approval 0
+```
+
+现有指标：`hr_candidates_total`、`hr_messages_total`、`hr_pending_approval`、
+`hr_outbound_failed`、`hr_screened_rejected_total`。
+
+> 为什么是这几个：`hr_outbound_failed` 涨 = 发信在失败；`hr_pending_approval` 长期不为 0
+> = HR 忘了确认，候选人一直收不到通知。这两个是最值得告警的。
+
+---
+
+## 六、错误码
 
 | code | HTTP | 触发场景 |
 |---|---|---|
 | `validation_failed` | 400 | 参数缺失、上传空文件、简历无法解析入库 |
+| `unauthorized` | 401 | 缺令牌 / 令牌不对（除 `/health` 与飞书回调外的所有接口） |
 | `not_found` | 404 | 候选人 / 资源不存在 |
 | `conflict` | 409 | 状态冲突 |
 | `configuration_error` | 500 | 配置缺失或非法（如飞书加密推送未支持） |

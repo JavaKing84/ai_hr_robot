@@ -29,9 +29,12 @@ import model  # noqa: E402,F401  注册全部 ORM 模型
 
 config = context.config
 
-# 从 .env / 环境变量注入数据库 URL（异步引擎用）
-settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
+# 数据库 URL 的来源优先级：调用方显式注入（应用启动时自动迁移、或脚本指定目标库）
+# > .env / 环境变量。前者必须在 set_main_option 之后仍然生效，否则「应用对 A 库
+# 迁移、实际迁移了 .env 里的 B 库」这种事故迟早发生。
+if not config.get_main_option("sqlalchemy.url"):
+    settings = get_settings()
+    config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

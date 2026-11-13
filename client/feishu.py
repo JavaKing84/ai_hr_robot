@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -65,9 +66,7 @@ class FeishuClient:
         return self._client
 
     # ------------------------------------------------------------ 出站：统一入口
-    # 2026-11-13：主管/HR 的推送渠道由「open_id 单聊私信」改为「群机器人」。
-    # 群机器人（自定义机器人）用 webhook 发消息，不需要 app 凭证；但上传文件必须
-    # 用 app 身份（im/v1/files）+ chat_id，因此两条路都留了降级。
+    # 群机器人用 webhook 发消息、不需要 app 凭证；上传文件仍走 app 身份（im/v1/files）。
     async def push_text(self, open_id: str, text: str) -> FeishuSendResult:
         """按 ``FEISHU_PUSH_TARGET`` 决定发群还是发个人私聊。"""
         if self.settings.feishu_group_push:
@@ -400,20 +399,70 @@ class FeishuClient:
 
     # ---------------------------------------------------------- 入站：解密
     def decode_webhook(self, body: bytes, headers: Mapping[str, str] | None = None) -> dict[str, Any]:
-        """解析 webhook 原始请求体：处理 encrypt 加密体并校验 verification token。"""
+        """解析 webhook 原始请求体：先验来源，再解密。
+
+        2026-11-14 加固（原来「token 为空就整体跳过校验」，等于生产环境不设防）：
+        1. 配了 ``FEISHU_ENCRYPT_KEY`` → 校验 ``X-Lark-Signature``
+           （``sha256(timestamp + nonce + encrypt_key + body)``），签名不符直接拒；
+        2. 配了 ``FEISHU_VERIFICATION_TOKEN`` → payload 里的 token **必须存在且相等**
+           （原来只判「两边都有值时才比」，缺 token 就能过）；
+        3. 两者都没配 → dev 环境放行并告警，非 dev 直接拒收。
+        """
         try:
             payload = json.loads(body.decode("utf-8") or "{}")
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ConfigurationError("飞书回调请求体不是合法 JSON") from exc
 
+        self._verify_signature(body, headers or {})
+
         if "encrypt" in payload:
             payload = self._decrypt(payload["encrypt"])
 
-        token = payload.get("token") or (payload.get("header") or {}).get("token") or ""
-        expected = self.settings.feishu_verification_token
-        if expected and token and token != expected:
-            raise ConfigurationError("飞书回调 verification token 不匹配")
+        self._verify_token(payload)
         return payload
+
+    def _verify_signature(self, body: bytes, headers: Mapping[str, str]) -> None:
+        """校验飞书请求签名（只有配了 encrypt_key 才有意义）。"""
+        encrypt_key = (self.settings.feishu_encrypt_key or "").strip()
+        if not encrypt_key or self.settings.feishu_verify_mode == "off":
+            return
+
+        lowered = {str(k).lower(): v for k, v in headers.items()}
+        signature = (lowered.get("x-lark-signature") or "").strip()
+        timestamp = (lowered.get("x-lark-request-timestamp") or "").strip()
+        nonce = (lowered.get("x-lark-request-nonce") or "").strip()
+        if not signature:
+            raise ConfigurationError("飞书回调缺少 X-Lark-Signature（已配置 ENCRYPT_KEY，必须验签）")
+
+        import hashlib
+
+        expected = hashlib.sha256(
+            (timestamp + nonce + encrypt_key).encode("utf-8") + body
+        ).hexdigest()
+        if not secrets.compare_digest(expected, signature):
+            raise ConfigurationError("飞书回调签名校验失败")
+
+    def _verify_token(self, payload: dict[str, Any]) -> None:
+        """校验 verification token。"""
+        mode = self.settings.feishu_verify_mode
+        if mode == "off":
+            return
+
+        expected = (self.settings.feishu_verification_token or "").strip()
+        token = str(payload.get("token") or (payload.get("header") or {}).get("token") or "")
+
+        if expected:
+            if not token or not secrets.compare_digest(token, expected):
+                raise ConfigurationError("飞书回调 verification token 不匹配（或缺失）")
+            return
+
+        # 一个都没配：非 dev 环境拒收，避免「上线即裸奔」
+        if mode == "strict" or self.settings.environment.lower() not in {"dev", "development", "local", "test"}:
+            raise ConfigurationError(
+                "飞书回调未配置 FEISHU_VERIFICATION_TOKEN / FEISHU_ENCRYPT_KEY，"
+                "非 dev 环境拒绝接收（可在 .env 补 token，或显式设 FEISHU_VERIFY_MODE=off）"
+            )
+        logger.warning("feishu.webhook_unverified", extra=log_extra(reason="dev 环境且未配置 token"))
 
     def _decrypt(self, encrypted: str) -> dict[str, Any]:
         """使用官方 SDK 的 AES 解密工具（不自行实现加解密算法）。"""
@@ -543,6 +592,134 @@ class FeishuClient:
             return response.file.read()
 
         return await asyncio.to_thread(_call)
+
+    # ------------------------------------------------- 入站：主动拉群消息
+    # 为什么要有这条通道：Webhook 要求飞书服务器能回连到本机。开发机、内网机器、
+    # 没做穿透的部署全都收不到 ``im.message.receive_v1``——机器人发了消息，主管回了
+    # 话，系统却完全听不见，界面上看着就是「消息发出去了，但没人应」。
+    # 主动拉取不依赖入站网络：只要应用有 ``im:message:readonly``（或 ``im:message``）
+    # 且机器人在群里，就能把群里的新消息读回来，效果与 webhook 一致。
+    async def list_chat_messages(
+        self,
+        chat_id: str,
+        *,
+        start_time: int | None = None,
+        page_size: int = 20,
+    ) -> list[dict[str, Any]]:
+        """拉取群消息，按时间正序返回归一后的 dict（机器人自己发的不在里面）。"""
+        chat_id = (chat_id or "").strip()
+        if not chat_id or not self.settings.feishu_live:
+            return []
+
+        def _call() -> Any:
+            from lark_oapi.api.im.v1 import ListMessageRequest
+
+            builder = (
+                ListMessageRequest.builder()
+                .container_id_type("chat")
+                .container_id(chat_id)
+                .sort_type("ByCreateTimeDesc")
+                .page_size(max(1, min(page_size, 50)))
+            )
+            if start_time:
+                builder = builder.start_time(str(int(start_time)))
+            return self._sdk().im.v1.message.list(builder.build())
+
+        try:
+            response = await asyncio.to_thread(_call)
+        except Exception as exc:  # noqa: BLE001 - 拉取失败只影响本轮，别把定时任务打挂
+            logger.warning("feishu.list_messages.failed", extra=log_extra(error=str(exc)))
+            return []
+
+        if not response.success():
+            # 常见原因：应用没开 im:message:readonly，或机器人不在该群
+            logger.warning(
+                "feishu.list_messages.rejected",
+                extra=log_extra(error=f"code={response.code} msg={response.msg}"),
+            )
+            return []
+
+        items = getattr(response.data, "items", None) or []
+        collected: list[dict[str, Any]] = []
+        for item in items:
+            normalized = self._normalize_chat_message(item)
+            if normalized is not None:
+                collected.append(normalized)
+        collected.sort(key=lambda it: it["create_time_ms"])
+        return collected
+
+    def _normalize_chat_message(self, item: Any) -> dict[str, Any] | None:
+        """把 ``im.v1.messages.list`` 的单条结果转成与 webhook 同形状的 dict。"""
+        sender = getattr(item, "sender", None)
+        sender_type = (getattr(sender, "sender_type", "") or "").lower()
+        # sender_type=app 就是机器人自己（也包括本应用发出去的分发包）：读回来再处理
+        # 会自己回自己，必须挡掉。
+        if sender_type == "app":
+            return None
+
+        message_id = getattr(item, "message_id", "") or ""
+        if not message_id:
+            return None
+
+        msg_type = getattr(item, "msg_type", "") or "text"
+        body = getattr(item, "body", None)
+        content = getattr(body, "content", "") if body is not None else ""
+        raw_mentions = getattr(item, "mentions", None) or []
+        mentions = [
+            {"key": getattr(m, "key", "") or "", "name": getattr(m, "name", "") or ""}
+            for m in raw_mentions
+        ]
+        text = content_to_text(msg_type, content, mentions)
+        # 群里 @机器人 后文本形如「@HR助手 确认 1,3」，把开头的 @昵称 剥掉，
+        # 否则下游按「第一句是不是确认」判断会全部落到兜底分支。
+        text = _strip_leading_mentions(text, mentions)
+
+        try:
+            create_ms = int(getattr(item, "create_time", "0") or 0)
+        except (TypeError, ValueError):
+            create_ms = 0
+
+        return {
+            "message_id": message_id,
+            "sender_id": getattr(sender, "id", "") or "",
+            "sender_type": sender_type,
+            "msg_type": msg_type,
+            "content": content,
+            "text": text,
+            "mentions": mentions,
+            "create_time_ms": create_ms,
+            "received_at": _event_time(create_ms),
+            "chat_id": getattr(item, "chat_id", "") or "",
+        }
+
+    def to_inbound_message(self, item: dict[str, Any]) -> InboundMessage:
+        """把拉取结果转成内部 ``InboundMessage``，与 webhook 分支共用同一条解析管道。"""
+        return InboundMessage(
+            channel="feishu",
+            sender_id=item.get("sender_id", ""),
+            text=item.get("text", ""),
+            thread_id=item.get("chat_id", "") or self.settings.feishu_chat_id,
+            message_id=item.get("message_id", ""),
+            kind="text",
+            received_at=item.get("received_at") or datetime.now(timezone.utc).replace(tzinfo=None),
+            raw_event={"source": "poll", "msg_type": item.get("msg_type", "")},
+        )
+
+
+def _strip_leading_mentions(text: str, mentions: list[dict[str, Any]]) -> str:
+    """去掉开头的 ``@某人`` 前缀（只按已知 mention 名字剥，避免误删正文里的 @）。"""
+    out = text.lstrip()
+    names = [m.get("name") for m in mentions if m.get("name")]
+    changed = True
+    while changed:
+        changed = False
+        for name in names:
+            prefix = f"@{name}"
+            if out.startswith(prefix):
+                out = out[len(prefix) :].lstrip(" :：,，、")
+                changed = True
+                break
+    return out
 
 
 # --------------------------------------------------------------------- 工具

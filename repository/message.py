@@ -50,6 +50,26 @@ class MessageRepository(BaseRepository[Message]):
         )
         return result.scalars().first()
 
+    async def seen_inbound(self, channel: str, external_id: str) -> bool:
+        """这条入站消息是否已经处理过。
+
+        飞书回调在 3 秒内没拿到 200 就会重投，IMAP 侧也可能因为水位丢失重拉历史邮件。
+        重复处理最坏的后果不是多一条留痕，而是**再给主管推一次改期请示、
+        或者重复回复候选人**。所以在入口处按 (channel, external_id) 判重。
+        """
+        if not external_id:
+            return False
+        result = await self.session.execute(
+            select(Message.id)
+            .where(
+                Message.channel == channel,
+                Message.direction == Direction.INBOUND,
+                Message.external_id == external_id,
+            )
+            .limit(1)
+        )
+        return result.scalars().first() is not None
+
     async def find_delivered_by_content(
         self, *, channel: str, recipient: str, body: str
     ) -> Message | None:

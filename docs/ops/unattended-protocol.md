@@ -9,16 +9,14 @@
 
 ```bash
 # 1. 创建并激活虚拟环境
-python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# Linux/Mac:
-source .venv/bin/activate
-# 2. 安装依赖
-pip install -r requirements-dev.txt
+# 1. 装 uv（一次性）
+winget install --id=astral-sh.uv -e
+# 2. 装依赖（自动建 .venv、自动选 Python 3.12）
+uv sync
 ```
 
-`requirements-dev.txt` 已包含 `requirements.txt` 的全部运行时依赖（含 `litellm`、`unstructured[pdf,docx]`、`pypdf`、`lark-oapi`、`apscheduler`），**不需要额外安装任何包**。
+`uv sync` 会按 `pyproject.toml` + `uv.lock` 装齐全部运行时依赖与 pytest，
+**不需要额外安装任何包**；扫描件 PDF 需要更强解析时再 `uv sync --extra ocr`。
 
 ### 1.1 数据库（PostgreSQL）
 
@@ -30,7 +28,7 @@ docker compose up -d postgres
 docker compose ps          # 应显示 healthy
 ```
 
-已有的旧 SQLite 库需要搬运时，用 `scripts/migrate_sqlite_to_pg.py`（见 `docs/database-setup.md` §5）。
+数据库只支持 PostgreSQL（见 `docs/database-setup.md`）；旧 SQLite 数据已于 2026-11-14 一次性搬迁完毕，脚本已删除。
 
 ### 1.2 配置 `.env`
 

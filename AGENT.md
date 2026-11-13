@@ -93,7 +93,7 @@ departments:
 
 | 变量 | 说明 |
 |---|---|
-| `DATABASE_URL` | `postgresql+asyncpg://hr:hr@localhost:5432/hr_robot` 或 `sqlite+aiosqlite:///./var/hr.db` |
+| `DATABASE_URL` | `postgresql+asyncpg://hr:hr@localhost:5432/hr_ai_robot`（只支持 PostgreSQL） |
 | `HR_MAILBOX` / `HR_SENDER_NAME` | 发件地址与显示名 |
 | `SMTP_*` / `IMAP_*` | 收发服务器与账号密码 |
 | `FEISHU_APP_ID` / `SECRET` / `VERIFICATION_TOKEN` / `ENCRYPT_KEY` | 自建应用凭据 |

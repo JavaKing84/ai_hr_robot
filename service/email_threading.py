@@ -90,10 +90,7 @@ class EmailThreadService:
         self.threads = EmailThreadRepository(session)
 
     async def match(self, email: InboundEmail) -> ThreadMatch:
-        # 带简历附件 = 一次新的投递。平台通知发件人是共享的，不能作为身份依据，
-        # 否则「第一位候选人」会把后面所有人的简历都吞成自己的回信。
-        # 注意：上面基于 In-Reply-To / References / reply+token 的线程匹配仍然有效，
-        # 只有「按发件人邮箱猜身份」这两个兜底被禁用。
+        # 带简历附件 = 新投递：平台通知发件人是共享的，不能当身份依据，否则会吞掉别人回信。
         skip_sender_fallback = has_resume_attachment(email)
 
         thread, reason = await self._locate_thread(email)

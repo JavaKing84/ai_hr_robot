@@ -18,14 +18,15 @@ class Base(DeclarativeBase):
 
 
 def build_engine(database_url: str, *, echo: bool = False) -> AsyncEngine:
-    kwargs: dict = {"echo": echo, "pool_pre_ping": True}
-    if database_url.startswith("sqlite"):
-        # SQLite 单文件、多连接场景（测试 / 本地演示）下必须放开线程检查
-        kwargs["connect_args"] = {"check_same_thread": False}
-    else:
-        kwargs["pool_size"] = 10
-        kwargs["max_overflow"] = 20
-    return create_async_engine(database_url, **kwargs)
+    """建异步引擎。只认 PostgreSQL——开发、测试、生产同一套方言，不留第二套分支。"""
+    if not database_url.startswith("postgresql"):
+        raise ValueError(
+            "DATABASE_URL 必须是 PostgreSQL（postgresql+asyncpg://...），"
+            f"收到：{database_url.split('://')[0]}"
+        )
+    return create_async_engine(
+        database_url, echo=echo, pool_pre_ping=True, pool_size=10, max_overflow=20
+    )
 
 
 def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
@@ -67,7 +68,7 @@ async def ensure_database_exists(
 ) -> bool:
     """确保 ``database_url`` 指向的库存在，不存在就自动创建。
 
-    只支持 PostgreSQL（SQLite 是文件，不需要建库）。返回 ``True`` 表示本次新建。
+    只支持 PostgreSQL。返回 ``True`` 表示本次新建。
 
     连的是 ``maintenance_db``（默认 ``postgres``）而不是目标库——目标库还不存在时
     必须先连一个已存在的库才能执行 ``CREATE DATABASE``。

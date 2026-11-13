@@ -24,6 +24,10 @@ services:
       ENVIRONMENT: prod
       DATABASE_URL: postgresql+asyncpg://hr:hr@postgres:5432/hr_robot
       TIMEZONE: ${TIMEZONE:-Asia/Shanghai}
+      # 内部接口令牌：容器内默认必须配（未配则 /health 会显示 auth=disabled）
+      API_TOKEN: ${API_TOKEN:-}
+      # 启动时自动 alembic upgrade head
+      AUTO_MIGRATE: ${AUTO_MIGRATE:-true}
       # 飞书
       FEISHU_MODE: ${FEISHU_MODE:-mock}
       FEISHU_APP_ID: ${FEISHU_APP_ID:-}
@@ -53,6 +57,10 @@ services:
       INBOUND_POLL_SECONDS: ${INBOUND_POLL_SECONDS:-300}
     ports:
       - "8000:8000"
+    volumes:
+      # 简历原件 / 简历包 zip / IMAP 水位 / mock outbox 都在 app 容器内的 var/。
+      # 不挂卷的话：容器一重建就丢原件，水位一丢就会把历史邮件当新邮件重拉一遍。
+      - ./var:/app/var
     depends_on:
       postgres:
         condition: service_healthy

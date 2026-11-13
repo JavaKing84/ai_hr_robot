@@ -1,0 +1,2 @@
+{{ supervisor_title }}，已按您的话安排 {{ count }} 人面试：
+{% for it in items %}{{ loop.index }}. {{ it.name }}｜{{ it.position_title }}｜{{ it.time }}{% if it.score %}｜{{ it.score }} 分{% endif %}{{ "\n" }}{% endfor %}地点：{{ location }}{{ "\n" }}{% if draft_mode %}（演练模式：通知只存草稿，没有真投给候选人。）{{ "\n" }}{% else %}面试通知已发到候选人邮箱。候选人回信改期或放弃，我在这里报给你。{{ "\n" }}{% endif %}{% if failed %}{{ "\n" }}以下 {{ failed_count }} 人没能安排：{{ "\n" }}{% for it in failed %}· {{ it.name }}：{{ it.reason }}{{ "\n" }}{% endfor %}{% endif %}{{ "\n" }}要调整就说「某某改到某天某点」。

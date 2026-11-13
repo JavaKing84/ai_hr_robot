@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends
 from client.mailbox import InboundEmail
 from core.deps import Services, get_services
 from core.logging import get_logger, log_extra
+from core.security import require_api_token
 from core.timeparse import now_utc_naive
 from schema.candidate import (
     EmailPollResponse,
@@ -19,7 +20,11 @@ from schema.candidate import (
 
 logger = get_logger(__name__)
 
-router = APIRouter(prefix="/email", tags=["email"])
+router = APIRouter(
+    prefix="/email",
+    tags=["email"],
+    dependencies=[Depends(require_api_token)],
+)
 
 
 @router.post("/poll", response_model=EmailPollResponse, summary="手动触发一次收信")

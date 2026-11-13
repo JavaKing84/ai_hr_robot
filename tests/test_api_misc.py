@@ -62,13 +62,12 @@ def test_repository_has_no_frontend_files() -> None:
     assert offenders == [], f"仓库中不允许出现前端文件: {offenders}"
 
 
-def test_requirements_pin_apscheduler_v3() -> None:
-    text = (BASE_DIR / "requirements.txt").read_text(encoding="utf-8")
-    lines = [line.strip() for line in text.splitlines() if line.strip().lower().startswith("apscheduler")]
-    assert lines == ["apscheduler>=3.11,<4"]
+def test_dependencies_pin_apscheduler_v3() -> None:
+    text = (BASE_DIR / "pyproject.toml").read_text(encoding="utf-8")
+    assert '"apscheduler>=3.11,<4"' in text.lower()
 
 
-def test_requirements_have_no_frontend_dependencies() -> None:
-    text = (BASE_DIR / "requirements.txt").read_text(encoding="utf-8").lower()
+def test_dependencies_have_no_frontend_packages() -> None:
+    text = (BASE_DIR / "pyproject.toml").read_text(encoding="utf-8").lower()
     for package in FRONTEND_PACKAGES:
         assert package not in text, f"不应引入前端依赖: {package}"

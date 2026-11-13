@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from client.llm import LLMClient
 from config.settings import Settings
 from core.logging import get_logger, log_extra
-from core.timeparse import format_interview_time, now_local
+from core.timeparse import format_interview_time, now_local, to_local
 from model.candidate import Candidate, CandidateStatus
 from model.event import Actor
 from model.message import Channel, Message
@@ -44,12 +44,23 @@ logger = get_logger(__name__)
 
 _ABILITIES = (
     "1. 查候选人：名单、状态、分数、学历经验；\n"
-    "2. 解释分数：这个分怎么算的、硬性条件过没过；\n"
-    "3. 看统计：本轮收了多少、通过多少、淘汰多少；\n"
-    "4. 读简历：某个人会不会某项技术、有没有某类项目经验；\n"
-    "5. 安排面试：说「通知谁、什么时间」我就发面试通知；\n"
-    "6. 改期/确认/取消：按你说的调整面试安排。"
+    "2. 筛选前 N 份：说「筛 5 份」，我把分数最高的 5 份挑出来并给简历链接；\n"
+    "3. 解释分数：这个分怎么算的、硬性条件过没过；\n"
+    "4. 看统计：今天收了多少、通过多少、淘汰多少；\n"
+    "5. 读简历：某个人会不会某项技术、有没有某类项目经验；\n"
+    "6. 安排面试：说「通知谁、什么时间」我就发面试通知；\n"
+    "7. 改期/确认/取消：按你说的调整面试安排。"
 )
+
+
+def _safe_int(raw: Any) -> int:
+    """模型给的份数可能是 5、"5"、"五份"；认不出来就当没说（返回 0）。"""
+    if isinstance(raw, bool):
+        return 0
+    if isinstance(raw, (int, float)):
+        return max(0, int(raw))
+    digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    return int(digits) if digits else 0
 
 
 @dataclass
@@ -149,15 +160,14 @@ class AgentService:
             reason=str(data.get("reason") or "").strip(),
             method="llm",
             raw_intent=str(data.get("intent") or ""),
+            count=_safe_int(data.get("count")),
         )
         try:
             plan.confidence = max(0.0, min(1.0, float(data.get("confidence") or 0.0)))
         except (TypeError, ValueError):
             plan.confidence = 0.0
 
-        # 姓名接地：写操作只能从「该主管职位下未淘汰的候选人」里选人。
-        # roster 只包含可排期状态（dispatched 等），但「淘汰」可能针对刚筛选通过
-        # 还没发主管的人，所以名单外的名字再查一次库确认。
+        # 姓名接地：写操作只能从该主管职位下、可排期的候选人里选人。
         if plan.is_write:
             allowed = {c.name for c in pool_list if c.name}
             plan.names = [name for name in plan.names if name in allowed]
@@ -331,20 +341,23 @@ class AgentService:
             rows.extend(await self.candidates.list_by_position(position.id))
         return rows
 
-    @staticmethod
-    def _stats_text(all_rows: Sequence[Candidate]) -> str:
-        """一行状态统计（所有读意图都会带上，便于回答顺带问到的数字）。"""
+    def _stats_text(self, all_rows: Sequence[Candidate]) -> str:
+        """两行统计：先今天的（HR 最常问），再累计的。"""
         if not all_rows:
             return "该主管名下还没有任何候选人记录"
+        tz = self.settings.timezone
+        today = now_local(tz).date()
+        today_rows = [
+            c for c in all_rows if c.created_at and to_local(c.created_at, tz).date() == today
+        ]
+        passed = sum(1 for c in today_rows if c.status != CandidateStatus.SCREENED_REJECTED)
+        rejected = len(today_rows) - passed
         counter = Counter(CandidateStatus.LABELS.get(c.status, c.status) for c in all_rows)
-        summary = f"累计 {len(all_rows)} 人：" + "；".join(
-            f"{label} {count} 人" for label, count in counter.items()
+        parts = "；".join(f"{label} {count} 人" for label, count in counter.items())
+        return (
+            f"今天收到 {len(today_rows)} 份（通过 {passed} 份、淘汰 {rejected} 份）；"
+            f"累计 {len(all_rows)} 人：{parts}"
         )
-        cycles = Counter(str(c.cycle_id) for c in all_rows if c.cycle_id)
-        if cycles:
-            latest_cycle, count = cycles.most_common(1)[0]
-            summary += f"；最近一轮（{latest_cycle}）{count} 人"
-        return summary
 
     async def _resolve_targets(
         self,
@@ -437,19 +450,60 @@ class AgentService:
         return out
 
     async def _history(self, *, sender_id: str = "", limit: int = 6) -> list[str]:
-        """取最近几条飞书对话做上下文（群聊无法按人精确切分，按时间取即可）。"""
+        """取最近几条**这个人的**飞书对话做上下文。
+
+        2026-11-14 修正：原实现取的是「全表最近 6 条飞书消息」，群里三个主管同时说话时
+        上下文会串（李四问的话被张伟的上一句带偏）。现在：
+        - 只取该 sender 自己发的入站消息；
+        - 机器人回复没有收件人级归属，退而取「该 sender 最早一条之后」的机器人消息；
+        - 拿不到 sender（内部调用）时保持原行为，避免影响邮件/脚本路径。
+        """
         if limit <= 0:
             return []
-        stmt = (
+
+        if not sender_id:
+            stmt = (
+                select(Message)
+                .where(Message.channel == Channel.FEISHU)
+                .order_by(Message.id.desc())
+                .limit(limit)
+            )
+            rows = list((await self.session.execute(stmt)).scalars().all())
+            return self._history_lines(rows)
+
+        own_stmt = (
             select(Message)
-            .where(Message.channel == Channel.FEISHU)
+            .where(
+                Message.channel == Channel.FEISHU,
+                Message.direction == "inbound",
+                Message.sender == sender_id,
+            )
             .order_by(Message.id.desc())
             .limit(limit)
         )
-        result = await self.session.execute(stmt)
-        rows = list(result.scalars().all())
+        own = list((await self.session.execute(own_stmt)).scalars().all())
+        if not own:
+            return []
+
+        floor_id = min(row.id for row in own)
+        robot_stmt = (
+            select(Message)
+            .where(
+                Message.channel == Channel.FEISHU,
+                Message.direction == "outbound",
+                Message.id >= floor_id,
+            )
+            .order_by(Message.id.desc())
+            .limit(limit)
+        )
+        robot = list((await self.session.execute(robot_stmt)).scalars().all())
+        merged = sorted({row.id: row for row in (*own, *robot)}.values(), key=lambda row: row.id)
+        return self._history_lines(merged[-limit:])
+
+    @staticmethod
+    def _history_lines(rows: Sequence[Message]) -> list[str]:
         lines: list[str] = []
-        for row in reversed(rows):
+        for row in rows:
             who = "主管" if row.direction == "inbound" else "机器人"
             body = (row.body or "").replace("\n", " ").strip()
             if body:

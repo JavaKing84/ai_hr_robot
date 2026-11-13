@@ -9,33 +9,44 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Float, Integer, String, Text
+from sqlalchemy import Boolean, Float, Index, Integer, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db import Base
-from model.base import TimestampMixin
+from model.base import JSONBType, TimestampMixin
 
 
 class Position(TimestampMixin, Base):
     __tablename__ = "positions"
+    __table_args__ = (
+        Index("ix_positions_code", "code", unique=True),
+        # 主管认人 + 只取在招：两条条件一起走索引，找「我名下有哪些在招职位」不必回表扫
+        Index(
+            "ix_positions_supervisor_active",
+            "supervisor_open_id",
+            "active",
+            postgresql_where=text("active IS TRUE"),
+        ),
+        Index("ix_positions_department", "department"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    code: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    code: Mapped[str] = mapped_column(String(64), nullable=False)
     title: Mapped[str] = mapped_column(String(128), nullable=False)
     department: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     headcount: Mapped[int] = mapped_column(Integer, default=1)
     description: Mapped[str] = mapped_column(Text, default="")
-    keywords: Mapped[list[str]] = mapped_column(JSON, default=list)
+    keywords: Mapped[list[str]] = mapped_column(JSONBType, default=list)
 
     # 筛选规则快照
     threshold: Mapped[float] = mapped_column(Float, default=60.0)
     rule_version: Mapped[str] = mapped_column(String(32), default="v1")
-    screening: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    screening: Mapped[dict[str, Any]] = mapped_column(JSONBType, default=dict)
 
     # 主管映射（飞书定向 + 邮箱副本）
     supervisor_name: Mapped[str] = mapped_column(String(64), default="")
     supervisor_title: Mapped[str] = mapped_column(String(32), default="")
-    supervisor_open_id: Mapped[str] = mapped_column(String(128), default="", index=True)
+    supervisor_open_id: Mapped[str] = mapped_column(String(128), default="")
     supervisor_email: Mapped[str] = mapped_column(String(255), default="")
 
     active: Mapped[bool] = mapped_column(Boolean, default=True)

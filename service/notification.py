@@ -23,6 +23,7 @@ from client.feishu import FeishuClient
 from client.mailbox import MailAttachment, MailboxClient
 from config.settings import Settings
 from core.logging import get_logger, log_extra
+from core.paths import resolve_resume_path
 from core.timeparse import format_interview_time, now_utc_naive
 from model.candidate import Candidate, CandidateStatus
 from model.email_thread import EmailThread, ThreadKind
@@ -172,24 +173,47 @@ class NotificationService:
 
         email_result = await self._send_supervisor_email(position, candidates, package_path, package_name, received_count)
 
+        # 状态推进必须以「真的有某个渠道把简历包送到主管手上」为前提。
+        # 三条通道全挂却标成「已发主管」，等于告诉 HR「发了」而人没收到——
+        # 后面所有「主管为什么没反馈」的排查都会被这条脏数据带偏。
+        delivered = feishu_text.ok or file_result.ok or email_result.ok
         for candidate in candidates:
             from_state = candidate.status
-            candidate.status = CandidateStatus.DISPATCHED
-            candidate.cycle_id = cycle_id
-            await self.events.record(
-                "candidate.dispatched",
-                actor=Actor.ROBOT,
-                object_type="candidate",
-                object_id=candidate.id,
-                from_state=from_state,
-                to_state=CandidateStatus.DISPATCHED,
-                detail={
-                    "position_code": position.code,
-                    "supervisor": position.supervisor_name,
-                    "feishu_message_id": feishu_text.message_id,
-                    "email_message_id": email_result.message_id,
-                },
-            )
+            if delivered:
+                candidate.status = CandidateStatus.DISPATCHED
+                candidate.cycle_id = cycle_id
+                await self.events.record(
+                    "candidate.dispatched",
+                    actor=Actor.ROBOT,
+                    object_type="candidate",
+                    object_id=candidate.id,
+                    from_state=from_state,
+                    to_state=CandidateStatus.DISPATCHED,
+                    detail={
+                        "position_code": position.code,
+                        "supervisor": position.supervisor_name,
+                        "feishu_message_id": feishu_text.message_id,
+                        "email_message_id": email_result.message_id,
+                    },
+                )
+            else:
+                # 状态保持不变（仍是 screened_passed），下一轮 dispatch 会再次尝试
+                await self.events.record(
+                    "candidate.dispatch_failed",
+                    actor=Actor.ROBOT,
+                    object_type="candidate",
+                    object_id=candidate.id,
+                    from_state=from_state,
+                    to_state=from_state,
+                    detail={
+                        "position_code": position.code,
+                        "supervisor": position.supervisor_name,
+                        "feishu_error": feishu_text.error,
+                        "file_error": file_result.error,
+                        "email_error": email_result.detail,
+                    },
+                    note="三个渠道都没送达主管，状态不推进，下一轮重试",
+                )
         await self.session.commit()
 
         return PackageDispatchResult(
@@ -202,7 +226,7 @@ class NotificationService:
             package_path=str(package_path),
             feishu_message_id=feishu_text.message_id,
             email_message_id=email_result.message_id,
-            ok=feishu_text.ok and file_result.ok,
+            ok=delivered,
             error="; ".join(filter(None, [feishu_text.error, file_result.error, email_result.detail])),
         )
 
@@ -254,7 +278,7 @@ class NotificationService:
         with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("00-筛选说明.md", summary)
             for index, candidate in enumerate(candidates, start=1):
-                resume_path = Path(candidate.resume_path) if candidate.resume_path else None
+                resume_path = resolve_resume_path(candidate.resume_path)
                 if resume_path and resume_path.exists():
                     arcname = f"{index:02d}-{candidate.name or '候选人'}-{resume_path.name}"
                     archive.write(resume_path, arcname=arcname)
@@ -420,7 +444,11 @@ class NotificationService:
             await self.threads.append_message_id(thread, message_id)
 
         from_state = candidate.status
-        candidate.status = CandidateStatus.INTERVIEW_NOTIFIED
+        if result.ok:
+            candidate.status = CandidateStatus.INTERVIEW_NOTIFIED
+        # 发送失败时状态**不推进**：候选人仍停在「主管已反馈」，
+        # 下一轮 retry_failed_interview_notices 会按原 Message-ID 补发。
+        # 面试时间照样落库——补发要用它，而且 HR 需要看到「本应是什么时候」。
         candidate.interview_time = interview_time
         candidate.interview_location = place
         await self.session.flush()
@@ -451,6 +479,7 @@ class NotificationService:
                 "mode": result.mode if hasattr(result, "mode") else self.settings.mail_mode,
                 "error": result.error,
             },
+            note="" if result.ok else "发送失败：状态未推进，等下一轮按原 Message-ID 补发",
         )
         if not result.ok:
             logger.warning(
@@ -877,7 +906,10 @@ class NotificationService:
             await self.threads.append_message_id(thread, message_id)
 
         from_state = candidate.status
-        candidate.status = CandidateStatus.INTERVIEW_NOTIFIED
+        if result.ok:
+            candidate.status = CandidateStatus.INTERVIEW_NOTIFIED
+        # 改期确认发不出去就保持原状态：候选人以为没改、主管以为改了，
+        # 这种「两边认知不一致」比一封没发出去的邮件严重得多。
         candidate.interview_time = new_time
         candidate.interview_location = place
         await self.session.flush()
@@ -960,6 +992,40 @@ class NotificationService:
             text,
             position_id=position.id,
             kind="interview_receipt",
+        )
+
+    async def send_schedule_summary(
+        self,
+        supervisor_open_id: str,
+        *,
+        supervisor_title: str,
+        items: Sequence[dict[str, object]],
+        location: str,
+        draft_mode: bool = False,
+        failed: Sequence[dict[str, str]] = (),
+    ) -> NoticeResult:
+        """一条消息说清「安排了谁、各自什么时间、在哪里」。
+
+        为什么不按岗位拆成多条回执、也不再追加「请确认」：
+        主管一句话点了 3 个人，机器人的回执如果拆成「2 份待确认」「3 份待确认」
+        两条，等于让他把同一件事说两遍；而 ``request_interview_approval`` 是拿
+        第一条候选人的时间套给所有人，周涛的「今天 15:00」会被写成
+        「11-18 14:00」——时间必须逐人对，不能取第一条当代表。
+        """
+        text = self.render(
+            "feishu_schedule_summary.md",
+            supervisor_title=supervisor_title,
+            count=len(items),
+            items=list(items),
+            location=location,
+            draft_mode=draft_mode,
+            failed=list(failed),
+            failed_count=len(failed),
+        )
+        return await self.notify_supervisor(
+            supervisor_open_id,
+            text,
+            kind="interview_schedule_summary",
         )
 
     async def notify_supervisor_about_candidate(

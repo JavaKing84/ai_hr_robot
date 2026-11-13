@@ -1,15 +1,19 @@
-"""事件留痕：每一次状态变化 / 消息收发 / 筛选结果都追加一条（产品文档 `events`）。"""
+"""事件留痕：每一次状态变化 / 消息收发 / 筛选结果都追加一条（产品文档 `events`）。
+
+索引：``(object_type, object_id, id)`` 覆盖「查某个候选人的流水」，
+``(action, id)`` 覆盖「按动作筛最近事件」，``occurred_at`` 覆盖按时间窗统计。
+"""
 
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, BigInteger, DateTime, Integer, String, Text
+from sqlalchemy import BigInteger, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db import Base
-from model.base import TimestampMixin, utcnow_naive
+from model.base import JSONBType, TimestampMixin, UTCDateTime, utcnow_naive
 
 
 class Actor:
@@ -22,18 +26,23 @@ class Actor:
 
 class Event(TimestampMixin, Base):
     __tablename__ = "events"
+    __table_args__ = (
+        Index("ix_events_object", "object_type", "object_id", "id"),
+        Index("ix_events_action_id", "action", "id"),
+        Index("ix_events_occurred_at", "occurred_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    action: Mapped[str] = mapped_column(String(64), index=True)
+    action: Mapped[str] = mapped_column(String(64))
     actor: Mapped[str] = mapped_column(String(32), default=Actor.ROBOT)
     object_type: Mapped[str] = mapped_column(String(32), default="candidate")
-    object_id: Mapped[int | None] = mapped_column(BigInteger, index=True, nullable=True)
+    object_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     from_state: Mapped[str] = mapped_column(String(32), default="")
     to_state: Mapped[str] = mapped_column(String(32), default="")
-    detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSONBType, default=dict)
 
-    occurred_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
+    occurred_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow_naive)
     note: Mapped[str] = mapped_column(Text, default="")
 
     def __repr__(self) -> str:  # pragma: no cover

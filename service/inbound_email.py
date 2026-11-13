@@ -107,6 +107,18 @@ class InboundEmailService:
 
     # ------------------------------------------------------------------ 分流
     async def handle_email(self, email: InboundEmail, *, cycle_id: int | None = None) -> InboundOutcome:
+        # 幂等闸门：同一封邮件（同一 Message-ID）只处理一次。
+        # IMAP 水位丢失、或多实例轮询交错时会出现「同一封信被处理两遍」，
+        # 后果是重复给主管推送、重复补发邮件——这里在入口挡住。
+        if await self.messages.seen_inbound(Channel.EMAIL, email.message_id):
+            logger.info(
+                "inbound.duplicate_skipped",
+                extra=log_extra(message_id=email.message_id, subject=email.subject),
+            )
+            return InboundOutcome(
+                kind="duplicate", handled=False, detail={"reason": "重复邮件（Message-ID 已处理）"}
+            )
+
         match = await self.threads.match(email)
         # 双保险：即使线程匹配命中了主管/候选人，带简历附件的邮件也优先入库。
         # 真正需要按「回信」处理的邮件几乎不会带简历附件，且会带 In-Reply-To。

@@ -51,6 +51,11 @@ _SCHEDULABLE_STATUSES = (
 )
 _APPROVAL_WORDS = ("同意", "可以", "没问题", "行", "好的", "都行", "就这么定", "按这个时间")
 
+
+def _years_label(candidate: Candidate) -> str:
+    years = candidate.years_experience
+    return f"{years} 年经验" if years not in (None, "", 0) else ""
+
 # ---------------------------------------------------------------- 面试通知人工确认
 # 机器人先把通知挂起，并在飞书里请示；HR 回复下面这些词才真正投递。
 _CONFIRM_NOTICE_RE = re.compile(
@@ -93,6 +98,7 @@ class FeedbackService:
         self.notification = notification
         self.company = company or CompanyInfo()
         self.mailbox_config = mailbox_config or MailboxConfig()
+        self.llm = llm
         self.candidates = CandidateRepository(session)
         self.positions = PositionRepository(session)
         self.events = EventRepository(session)
@@ -149,11 +155,7 @@ class FeedbackService:
         )
         pending = [c for c in active if c.status == CandidateStatus.RESCHEDULE_PENDING]
 
-        # 场景 1（2026-11-13 新增）：自然语言路由。
-        # 模型只判断「这句话是问还是做」：
-        # - 读类 → 检索真实数据后由模型组织人话回答（不碰数据库）
-        # - 写类 → 仍交给下面的确定性代码执行（模型只提供名单与时间槽位）
-        # 模型不可用时 plan 恒为 None，下面的分支与改造前完全一致。
+        # 自然语言路由：读类由助手检索作答，写类仍走下面的确定性代码（模型只给名单与时间）。
         plan = await self.agent.plan(
             inbound,
             positions=positions,
@@ -175,6 +177,16 @@ class FeedbackService:
                 detail=reply.detail,
                 reply_text=reply.text,
             )
+
+        if plan is not None and plan.intent == AgentIntent.JOB_POSTING:
+            outcome = await self._handle_job_posting(inbound, supervisor)
+            await self.session.commit()
+            return outcome
+
+        if plan is not None and plan.intent == AgentIntent.SCREEN_TOP:
+            outcome = await self._handle_screen_top(inbound, supervisor, positions, plan, message_row)
+            await self.session.commit()
+            return outcome
 
         if plan is not None and plan.intent == AgentIntent.REJECT:
             outcome = await self._handle_reject(
@@ -277,7 +289,22 @@ class FeedbackService:
         results = await self.notification.confirm_pending_interview_notices(target_ids)
         ok = len([r for r in results if r.ok])
         failed = len(results) - ok
-        reply = f"已按您的确认发送 {ok} 份面试通知。"
+        # 演练模式（MAIL_MODE=mock）下邮件只写成 .eml 存本地，不会真的投递。
+        # 此时若照旧回「已发送」，主管会以为候选人已经收到通知——这是最坏的一种
+        # 假成功：库里状态是 interview_notified，候选人邮箱里却什么都没有。
+        mocked = len([r for r in results if r.ok and getattr(r, "mode", "") == "mock"])
+        if ok and mocked == ok:
+            reply = (
+                f"已处理 {ok} 份面试通知——当前是**演练模式**（MAIL_MODE=mock），"
+                f"邮件只生成草稿存在 var/outbox/mail，**没有投递给候选人**。\n"
+                "切回真实发送：把 .env 的 MAIL_MODE 改成 live 后重启服务。"
+            )
+        elif mocked:
+            reply = (
+                f"已发送 {ok} 份面试通知，其中 {mocked} 份为演练模式（仅存草稿、未投递）。"
+            )
+        else:
+            reply = f"已按您的确认发送 {ok} 份面试通知。"
         if failed:
             reply += f"另有 {failed} 份发送失败，我会稍后重试。"
         await self.notification.notify_supervisor(
@@ -313,11 +340,8 @@ class FeedbackService:
         *,
         prefilled: InterviewScheduleSchema | None = None,
     ) -> FeedbackOutcome:
-        # 可排期名单：除了「刚派发 / 已反馈」的人，还要包含「已通知面试」与
-        # 「候选人申请改期」——否则主管说「王耀国改到 11月15日上午十点」时，
-        # 这个人不在名单里，就会被当成看不懂而回一段格式说明（2026-11-13 修）。
-        # 已通知的人重排＝改期：状态回到 SUPERVISOR_FEEDBACK 并重新走一次
-        # 通知确认闸门，不会直接给候选人发第二封邮件。
+        # 可排期名单含「已通知 / 改期中」：否则主管说「某某改到某时」会被当成看不懂。
+        # 已通知的人重排＝改期，状态回 SUPERVISOR_FEEDBACK 并重走确认闸门。
         roster = [
             c
             for c in active
@@ -347,8 +371,31 @@ class FeedbackService:
         await self.session.flush()
 
         names = [name for name in schedule.candidate_names if name in set(roster_names)]
+        # 点名了但不在可排期名单里的人：绝不能静默丢掉。
+        # 原来这里直接 filter，主管说「通知李四，下周三下午两点」而李四处于
+        # screened_passed（还没发给主管）时，机器人既不排期、也不解释，
+        # 主管以为安排好了——这是本项目最危险的一类「假成功」。
+        requested = [name for name in schedule.candidate_names if name]
+        if not requested:
+            # 模型/规则都没抽出名字时，退一步在原文里找「主管名下确实存在的人名」。
+            # 否则「名单里一个都没解析到」和「解析到了但不能排期」会被混成同一句
+            # 通用格式提示，主管永远不知道问题出在人的状态上。
+            requested = await self._names_mentioned(inbound.text, positions)
+        else:
+            # 模型只抽到一部分名字时（「【周涛，张三】」只抽出周涛），
+            # 与它们并列、却没被抽出的词也要带出来——否则张三彻底消失，
+            # 主管以为两个人都安排了。
+            for extra in self._unknown_names_beside(inbound.text, requested):
+                if extra not in requested:
+                    requested.append(extra)
+        missing = [name for name in requested if name not in set(roster_names)]
+        missing_pairs = await self._unschedulable_pairs(missing, positions) if missing else []
+        missing_note = self._format_unschedulable(missing_pairs)
+
         if not names:
             text = self._format_hint(supervisor, roster)
+            if missing_note:
+                text = f"{missing_note}\n\n{text}"
             await self.notification.notify_supervisor(
                 supervisor.feishu_open_id,
                 text,
@@ -360,10 +407,19 @@ class FeedbackService:
                 actor=Actor.SUPERVISOR,
                 object_type="message",
                 object_id=message_row.id,
-                detail={"text": inbound.text[:500], "roster": roster_names},
-                note="未识别出面试名单，已回消息说明格式",
+                detail={
+                    "text": inbound.text[:500],
+                    "roster": roster_names,
+                    "unschedulable": missing,
+                },
+                note="未识别出可排期的面试名单，已回消息说明原因（含不可排期人员）",
             )
-            return FeedbackOutcome(handled=False, action="unparsed", reply_text=text)
+            return FeedbackOutcome(
+                handled=False,
+                action="unparsed",
+                reply_text=text,
+                detail={"unschedulable": missing},
+            )
 
         if schedule.interview_time is None:
             text = (
@@ -397,7 +453,8 @@ class FeedbackService:
 
         sent_total = 0
         pending_total = 0
-        receipts: list[tuple[Position, list[Candidate]]] = []
+        summary_items: list[dict[str, object]] = []
+        failed_items: list[dict[str, str]] = []
         for position_id, group in grouped.items():
             position = await self.session.get(Position, position_id)
             if position is None:
@@ -431,27 +488,53 @@ class FeedbackService:
             results = await self.notification.send_interview_notices(
                 group, position, interview_time=interview_time, location=location
             )
-            sent_total += len([r for r in results if r.ok and not r.pending])
-            pending_total += len([r for r in results if r.pending])
-            receipts.append((position, list(group)))
+            for candidate, result in zip(group, results):
+                if result.pending:
+                    pending_total += 1
+                elif result.ok:
+                    sent_total += 1
+                if not result.ok and not result.pending:
+                    failed_items.append(
+                        {"name": candidate.name or "未命名", "reason": result.detail or "发送失败"}
+                    )
+                    continue
+                # 时间逐人对：candidate.interview_time 是这一位自己落库的时间，
+                # 不能拿第一条的时间套给整批（周涛「今天 15:00」曾被写成 11-18）。
+                when = candidate.interview_time or interview_time
+                summary_items.append(
+                    {
+                        "name": candidate.name or "未命名",
+                        "position_title": position.title,
+                        "time": format_interview_time(when, self.settings.timezone),
+                        "score": f"{candidate.score:.1f}" if candidate.score else "",
+                    }
+                )
 
-        # 有待确认的通知：回执换成「请 HR 确认是否发送」的飞书请示，
-        # 在 HR 回复「确认」之前一封都不会投递。
+        # 只有「确认闸门开着」时才需要再问一句；闸门关掉后这里恒为 0，
+        # 主管说完就直接排，不再让他确认第二遍。
         if pending_total:
             await self.notification.request_interview_approval(
                 self._approval_open_id(supervisor),
                 supervisor_title=supervisor.title or supervisor.name,
             )
-        if sent_total:
-            for position, group in receipts:
-                await self.notification.send_receipt_to_supervisor(
-                    supervisor.feishu_open_id,
-                    supervisor_title=supervisor.title or supervisor.name,
-                    position=position,
-                    candidates=group,
-                    interview_time=interview_time,
-                    location=location,
-                )
+
+        # 排不了的人也要出现在同一条回执里，别让主管以为全都安排了。
+        for name, reason in missing_pairs:
+            failed_items.append({"name": name, "reason": reason})
+
+        # 一条消息说清所有人 + 各自时间 + 地点，不按岗位拆成多条。
+        if summary_items or failed_items:
+            await self.notification.send_schedule_summary(
+                supervisor.feishu_open_id,
+                supervisor_title=supervisor.title or supervisor.name,
+                items=summary_items,
+                location=location,
+                draft_mode=not self.settings.mail_live,
+                failed=failed_items,
+            )
+
+        # 排不了的人已并进上面那条回执的 failed 段，不再单独补发第二条，
+        # 否则主管一条指令收到两条消息、还得自己对哪条是结论。
 
         await self.events.record(
             "feedback.schedule_applied",
@@ -480,7 +563,126 @@ class FeedbackService:
                 "location": location,
                 "notices_sent": sent_total,
                 "notices_pending_confirm": pending_total,
+                "unschedulable": missing,
             },
+        )
+
+    async def handle_image(self, inbound: InboundMessage, image: bytes) -> FeedbackOutcome:
+        """飞书发来一张图（JD 截图）的入口：认人 → 落消息 → 走招聘需求解析。"""
+        supervisor = await self._resolve_supervisor(inbound)
+        if supervisor is None and (self.settings.hr_feishu_open_id or "").strip() == inbound.sender_id:
+            supervisor = await self._any_supervisor()
+        if supervisor is None:
+            return FeedbackOutcome(handled=False, action="supervisor_unknown", reply_text="发送者不是已登记的主管")
+        await self._record_inbound(inbound, supervisor)
+        outcome = await self._handle_job_posting(inbound, supervisor, image=image)
+        await self.session.commit()
+        return outcome
+
+    # ------------------------------------------------- 场景 B1：主管发招聘需求
+    async def _handle_job_posting(
+        self,
+        inbound: InboundMessage,
+        supervisor: Supervisor,
+        image: bytes | None = None,
+    ) -> FeedbackOutcome:
+        """主管发 JD（文字或截图）→ 解析成岗位配置并落盘，下一轮按新要求筛。"""
+        from service.job_intake import JobIntakeError, JobIntakeService, describe
+
+        intake = JobIntakeService(settings=self.settings, llm=self.llm)
+        try:
+            position = (
+                await intake.parse_image(image)
+                if image is not None
+                else await intake.parse(inbound.text)
+            )
+            path = intake.apply(position)
+        except JobIntakeError as exc:
+            text = str(exc)
+            await self.notification.notify_supervisor(
+                supervisor.feishu_open_id, text, kind="job_intake_failed"
+            )
+            return FeedbackOutcome(handled=False, action="job_intake_failed", reply_text=text)
+
+        # 立即同步进数据库，HR 不用等到下一轮才在职位列表里看到
+        await self.positions.sync_from_config(self.settings.load_company_config())
+        await self.events.record(
+            "position.intaken",
+            actor=Actor.SUPERVISOR,
+            object_type="position",
+            object_id=None,
+            detail={"code": position.code, "title": position.title, "file": str(path)},
+            note=f"主管发来招聘需求，已生成岗位配置：{position.title}",
+        )
+        text = describe(position)
+        await self.notification.notify_supervisor(supervisor.feishu_open_id, text, kind="job_intake")
+        return FeedbackOutcome(
+            handled=True,
+            action="job_intake",
+            detail={"code": position.code, "file": str(path)},
+            reply_text=text,
+        )
+
+    # ------------------------------------------------- 场景 B2：筛选前 N 份
+    async def _handle_screen_top(
+        self,
+        inbound: InboundMessage,
+        supervisor: Supervisor,
+        positions: Sequence[Position],
+        plan: AgentPlan,
+        message_row: Message,
+    ) -> FeedbackOutcome:
+        """「筛 5 份」：按分数取前 N 份，回一份带简历链接的短名单。"""
+        limit = min(max(plan.count or 5, 1), 20)
+        # 已派发给主管的也算「可筛」：HR 常说「先给我挑 5 份」，此时简历早已发出去
+        rows = await self.candidates.list_active_for_positions(
+            [p.id for p in positions],
+            statuses=[
+                CandidateStatus.RECEIVED,
+                CandidateStatus.SCREENED_PASSED,
+                CandidateStatus.DISPATCHED,
+                CandidateStatus.SUPERVISOR_FEEDBACK,
+            ],
+        )
+        rows = sorted(rows, key=lambda c: c.score or 0, reverse=True)[:limit]
+
+        if not rows:
+            text = "现在没有待筛的简历，最近一批已经发给你了。"
+            await self.notification.notify_supervisor(supervisor.feishu_open_id, text, kind="screen_empty")
+            return FeedbackOutcome(handled=True, action="screen_empty", reply_text=text)
+
+        base = self.settings.public_base_url.rstrip("/")
+        lines = [f"挑出 {len(rows)} 份（按分数）："]
+        for index, candidate in enumerate(rows, start=1):
+            bits = "·".join(
+                x for x in (candidate.education_level, candidate.school, _years_label(candidate)) if x
+            )
+            lines.append(f"{index}. {candidate.name} {round(candidate.score or 0, 1)}｜{bits}")
+            lines.append(f"   {base}/api/v1/recruitment/candidates/{candidate.id}/resume")
+        lines.append("看中谁，直接说「通知张三、李四，下周三下午两点」。")
+        text = "\n".join(lines)
+
+        for candidate in rows:
+            if candidate.status == CandidateStatus.RECEIVED:
+                candidate.status = CandidateStatus.SCREENED_PASSED
+                await self.events.record(
+                    "candidate.screened_on_demand",
+                    actor=Actor.SUPERVISOR,
+                    object_type="candidate",
+                    object_id=candidate.id,
+                    from_state=CandidateStatus.RECEIVED,
+                    to_state=CandidateStatus.SCREENED_PASSED,
+                    detail={"limit": limit, "source": inbound.channel},
+                    note=f"按主管要求挑出前 {limit} 份",
+                )
+        await self.notification.notify_supervisor(
+            supervisor.feishu_open_id, text, kind="screen_top"
+        )
+        return FeedbackOutcome(
+            handled=True,
+            action="screen_top",
+            detail={"count": len(rows), "candidate_ids": [c.id for c in rows]},
+            reply_text=text,
         )
 
     # ------------------------------------------------------- 场景 C：淘汰（自然语言）
@@ -718,6 +920,149 @@ class FeedbackService:
             source_quotes=[SourceQuote(field="card_action", quote=str(inbound.action)[:200])],
             method="rule",
         )
+
+    async def _names_mentioned(
+        self, text: str, positions: Sequence[Position]
+    ) -> list[str]:
+        """从主管原话里找人名：库里认得的 + 与他并列但库里没有的。
+
+        只在模型与规则都没抽出结构化名单时才兜底：主管写「把李四挪到下周」
+        这类没有标准句式的句子时，也要能用真实姓名把「他为什么排不了」
+        讲清楚，而不是回一句通用格式提示让人自己猜。
+
+        第二个来源（``_unknown_names_beside``）是 2026-11-14 补的：主管写
+        「【周涛，张三】今天下午 3 点」时，模型只抽出周涛，张三就彻底消失——
+        主管以为两个都安排了。与已识别人名**并列出现**的词要带出来，
+        让上层回一句「张三我这边没有这个人」。
+        """
+        if not text:
+            return []
+        position_ids = [p.id for p in positions if p.id]
+        if not position_ids:
+            return []
+        result = await self.session.execute(
+            select(Candidate.name).where(
+                Candidate.position_id.in_(position_ids), Candidate.name != ""
+            )
+        )
+        known = {name for name in result.scalars().all() if name}
+        if not known:
+            return []
+        # 长名字优先：「张三丰」命中后不再重复计一个「张三」
+        hits = [name for name in sorted(known, key=len, reverse=True) if name in text]
+        if not hits:
+            return []
+        return hits + self._unknown_names_beside(text, hits)
+
+    #: 并列片段里出现这些词时不算人名（避免把「下午三点」当成候选人）
+    _NOT_A_NAME = frozenset(
+        {
+            "今天", "明天", "后天", "昨天", "下周", "本周", "这周", "下月",
+            "上午", "下午", "晚上", "中午", "早上", "时间", "地点", "面试",
+            "通知", "安排", "可以", "即可", "我们", "他们", "你们", "简历",
+            "候选", "名单", "麻烦", "辛苦", "谢谢", "收到",
+        }
+    )
+
+    #: 剥掉已知人名后，残留词只要含这些字就判定不是姓名（多为动词/介词）
+    _NON_NAME_CHARS = frozenset("请于在把给让和跟到来去的了就还再又都也才被将对于与及或但是")
+
+    @classmethod
+    def _unknown_names_beside(cls, text: str, known_hits: Sequence[str]) -> list[str]:
+        """找出与已识别人名并列、但库里没有的姓名片段。
+
+        只收「同一并列组里已经有认得的人」这种高置信场景：
+        「【周涛，张三】」→ 周涛认得 → 张三收录；
+        「通知赵敏，陈静下周三下午两点」→ 剥掉赵敏后剩「通知」，不是人名，丢弃。
+        """
+        if not text or not known_hits:
+            return []
+
+        # 1) 括号里的并列名单最可靠，先处理
+        groups: list[list[str]] = []
+        for inner in re.findall(r"[【\[（(]([^】\]）)]+)[】\]）)]", text):
+            groups.append(re.split(r"[，,、/和及与\s]+", inner))
+        # 2) 整句按分隔符切，剥掉已识别人名后看剩什么
+        groups.append(re.split(r"[，,、/和及与\s]+", text))
+
+        extras: list[str] = []
+        for segments in groups:
+            cleaned = [seg.strip(" 　.。:：;；!！?？【】[]（）()") for seg in segments]
+            if not any(
+                any(name in seg for name in known_hits) for seg in cleaned if seg
+            ):
+                # 这一组里没有认得的人，说明不是并列名单，不敢猜
+                continue
+            for seg in cleaned:
+                if not seg:
+                    continue
+                rest = seg
+                for name in known_hits:
+                    rest = rest.replace(name, "")
+                rest = rest.strip(" 　.。:：;；!！?？")
+                if not (2 <= len(rest) <= 4) or not re.fullmatch(r"[\u4e00-\u9fa5]{2,4}", rest):
+                    continue
+                if rest in cls._NOT_A_NAME or rest in extras:
+                    continue
+                if cls._NON_NAME_CHARS & set(rest):
+                    continue
+                extras.append(rest)
+        return extras
+
+    async def _unschedulable_pairs(
+        self, names: Sequence[str], positions: Sequence[Position]
+    ) -> list[tuple[str, str]]:
+        """点名的人不在可排期名单里时，逐人给出（姓名, 原因）。
+
+        查库范围是**该主管名下全部职位**（不限状态），所以能覆盖：
+        刚筛选通过还没发主管、已淘汰、已放弃、已确认参加等情况；
+        库里完全没有这个名字时也明说，而不是当作没看见。
+
+        返回结构化而不是拼好的段落：调用方要把它并进「一条回执」的失败段，
+        自己拼字符串就只能再发第二条消息。
+        """
+        if not names:
+            return []
+        position_ids = [p.id for p in positions if p.id]
+        found: dict[str, Candidate] = {}
+        if position_ids:
+            rows = await self.candidates.list_by_names(names, position_ids)
+            for candidate in rows:
+                if candidate.name:
+                    found.setdefault(candidate.name, candidate)
+
+        reasons = {
+            CandidateStatus.RECEIVED: "刚收到、还没筛选，暂时不能排期",
+            CandidateStatus.PARSED: "刚解析完、还没筛选，暂时不能排期",
+            CandidateStatus.SCREENED_PASSED: "筛选通过但还没发给主管，暂时不能排期",
+            CandidateStatus.SCREENED_REJECTED: "已被判定不合适（已淘汰）",
+            CandidateStatus.DECLINED: "已放弃面试",
+            CandidateStatus.COMPLETED: "已确认参加，如需改期请直接说新时间",
+            CandidateStatus.INTERVIEW_PENDING_CONFIRM: "面试通知待 HR 确认，暂不重复安排",
+        }
+
+        pairs: list[tuple[str, str]] = []
+        for name in names:
+            candidate = found.get(name)
+            if candidate is None:
+                pairs.append((name, "我这边没有这个人（请确认姓名，或该候选人不在您名下职位）"))
+                continue
+            state = CandidateStatus.LABELS.get(candidate.status, candidate.status)
+            reason = reasons.get(candidate.status, "当前状态不可排期")
+            pairs.append((name, f"{state}——{reason}"))
+        return pairs
+
+    @staticmethod
+    def _format_unschedulable(pairs: Sequence[tuple[str, str]]) -> str:
+        if not pairs:
+            return ""
+        return "这几位这次没能安排：" + "\n" + "\n".join(f"· {n}：{r}" for n, r in pairs)
+
+    async def _explain_unschedulable(
+        self, names: Sequence[str], positions: Sequence[Position]
+    ) -> str:
+        """（兼容入口）返回拼好的说明段落。新代码请用 ``_unschedulable_pairs``。"""
+        return self._format_unschedulable(await self._unschedulable_pairs(names, positions))
 
     async def _resolve_supervisor(self, inbound: InboundMessage) -> Supervisor | None:
         """飞书按 open_id 认人，邮件按发件地址认人——两条路径都落到同一张 supervisors 表。"""

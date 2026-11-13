@@ -16,6 +16,10 @@
 | 面试通知确认闸门 | 面试通知先挂起，等 HR 回复「确认」才真正发邮件 | `INTERVIEW_NOTICE_REQUIRE_CONFIRM=true` |
 | 多供应商 LLM 降级链 | 主模型失败自动按顺序换下一家，全挂则回落到规则抽取 | `LLM_PROVIDERS`（JSON 数组） |
 | 语义分影子模式 + 深度解析 | 大模型打分落库留痕，但通过与否仍按规则分判定；附带 AI 亮点/风险/追问点 | `SEMANTIC_SHADOW=true`、`LLM_DEEP_ANALYSIS=true` |
+| 业务接口鉴权 | 除 `/health` 与飞书回调外，所有 `/api/v1/*` 都要令牌 | `API_TOKEN`（留空=只在 dev 放行） |
+| 运营视图（漏斗 / 指标） | `/ops/funnel`、`/ops/metrics`（Prometheus 文本）、`/recruitment/stats` | 无开关，随服务提供 |
+| 启动自动迁移 | 起服务时在咨询锁内 `alembic upgrade head`，多副本只有一个实例执行 | `AUTO_MIGRATE=true` |
+| 多副本互斥 | 每日闭环与入站轮询套 PG 咨询锁，双副本不会重复发简历包 | 无开关，自动生效 |
 
 > 语义分权重在 `config/positions.yaml` 每个岗位的 `semantic_weight` 字段（0~100，建议 25~35）。
 
@@ -133,13 +137,14 @@
 hr_ai_robot/
 │
 ├── README.md                        # 本文件：流程图 + 目录 + 怎么跑
-├── API.md                           # 所有 HTTP 接口：路由/入参/出参示例
 ├── AGENT.md                         # 边界/环境/配置/纪律/状态机（改代码前必读）
-├── DECISIONS.md                     # 决策台账：为什么这么设计、哪些明确不做
-├── requirements.txt                 # 运行依赖
-├── requirements-dev.txt             # 测试依赖（引用 requirements.txt）
+├── docs/API.md                      # 所有 HTTP 接口：路由/入参/出参示例
+├── docs/DECISIONS.md                # 决策台账：为什么这么设计、哪些明确不做
+├── pyproject.toml                   # 依赖与 Python 版本（唯一来源）
+├── uv.lock                          # 锁定版本，`uv sync` 装出完全一致的环境
+├── .python-version                  # 3.12，uv 据此选解释器
 ├── pytest.ini                       # pytest 配置：asyncio 自动模式
-├── Dockerfile                       # 镜像：python3.11-slim + 解析器系统库
+├── Dockerfile                       # 镜像：python3.12-slim + uv sync + 解析器系统库
 ├── docker-compose.yml               # app + postgres 一键起
 ├── .env.example                     # 环境变量模板，复制成 .env 再填
 ├── .env                             # 你本机的真实配置（不入库）
@@ -254,7 +259,6 @@ hr_ai_robot/
 │   ├── feishu_ws_bridge.py          # 飞书长连接转本地 webhook
 │   ├── eval_extraction.py           # 抽取准确率评估
 │   ├── test_idempotency_demo.py     # 手动验证重复投递只留 1 条
-│   ├── migrate_sqlite_to_pg.py      # SQLite 旧库整表搬到 PostgreSQL
 │   ├── run_cycle_once.py            # 手动跑一轮闭环（不起服务）
 │   ├── check_mail_login.py          # 检查邮箱 IMAP 登录是否正常
 │   ├── interview_notices.py         # 查看/确认待发的面试通知
@@ -331,128 +335,245 @@ hr_ai_robot/
 
 ---
 
-## 4. 本地运行指南
+## 4. 本地开发指南
 
-数据库统一用 **PostgreSQL**（生产 / 本地 / 测试同一套引擎，不再有 SQLite 分支差异）。
-一条命令起库：`docker compose up -d postgres`（用户 `hr` / 密码 `hr` / 库 `hr_robot` / 端口 5432）。飞书、邮件、LLM 仍可全 mock，不配凭证也能跑通闭环。
+> 本章命令于 2026-11-14 在 **Windows 11 + Python 3.12.15 + uv 0.13.8 + PostgreSQL 16（Docker）** 上逐条实跑，
+> 最终 206 个用例全绿。环境不一致时先看 4.8 的报错对照表。
 
-### 4.1 Windows
+### 4.0 三条命令跑起来
 
-```bat
-:: 1) 取代码
-git clone <repo-url> hr_ai_robot
-cd hr_ai_robot
-
-:: 2) 建虚拟环境（Python >= 3.11）
-py -3.11 -m venv .venv
-.venv\Scripts\activate
-
-:: 3) 装依赖
-python -m pip install -U pip
-python -m pip install -r requirements.txt
-
-:: 4) 复制配置
-copy .env.example .env
+```bash
+uv sync                                     # 装依赖（按 uv.lock，同一份版本）
+uv run alembic upgrade head                 # 建表
+uv run python -m core.main                  # 起服务 → http://127.0.0.1:8000/docs
 ```
 
-确认 `.env` 里数据库指向 PostgreSQL（默认即是），其余保持 mock 即可：
+就这三条。`uv sync` 会自动找到/下载 Python 3.12 并建好 `.venv`，不需要手工 `venv` + `pip install`。
+
+想先看业务闭环、不接真实邮件（推荐）：
+
+```bash
+uv run python scripts/demo.py               # 6 份简历 → 筛选 → 分发，全程 mock
+```
+
+### 4.1 装 uv（只需一次）
+
+Windows（PowerShell）：
+
+```powershell
+winget install --id=astral-sh.uv -e
+```
+
+装完新开一个终端，`uv --version` 有输出即可。macOS / Linux：`brew install uv` 或 `curl -LsSf https://astral.sh/uv/install.sh | sh`。
+
+> `uv python install 3.12` 可让 uv 自己下载解释器；`pyproject.toml` 里已写死 `requires-python = ">=3.11,<3.14"`，
+> uv 不会去用 3.14（`greenlet` / `pydantic-core` 还没有稳定的 cp314 轮子）。
+
+### 4.2 准备数据库（PostgreSQL，唯一选项）
+
+**情况 A：用项目自带 compose（本机 5432 空闲）**
+
+```bash
+docker compose up -d postgres
+```
+
+**情况 B：复用本机已有 PostgreSQL（5432 被别的容器占用）**
+
+```bash
+docker exec -it <PG容器> psql -U postgres -c "CREATE ROLE hr LOGIN PASSWORD 'hr';"
+docker exec -it <PG容器> psql -U postgres -c "CREATE DATABASE hr_ai_robot OWNER hr;"
+```
+
+项目只支持 PostgreSQL：`core/db.py` 收到非 `postgresql://` 连接串会直接抛错，没有 SQLite 分支。
+
+### 4.3 配置 `.env`
+
+```bash
+cp .env.example .env      # Windows: copy .env.example .env
+```
+
+通常只改一行，其余留 mock 就能跑：
 
 ```ini
-DATABASE_URL=postgresql+asyncpg://hr:hr@localhost:5432/hr_robot
+DATABASE_URL=postgresql+asyncpg://hr:hr@localhost:5432/hr_ai_robot
 FEISHU_MODE=mock
 MAIL_MODE=mock
 LLM_MODE=auto
-SCHEDULE_CRON=0 9 * * *
+SCHEDULER_ENABLED=true
 ```
 
-```bat
-:: 5) 起数据库（需 Docker Desktop，只需第一次/重启后执行）
-docker compose up -d postgres
-
-:: 6) 建表（走 Alembic 迁移，版本化） + 写入测试公司（3 部门 / 3 主管 / 5 职位）
-python -m alembic upgrade head
-python scripts\seed.py --reset
-
-:: 7) 一条命令看完整个闭环（打印机器人真正发出的飞书文本和邮件正文）
-python scripts\demo.py --verbose
-
-:: 8) 起服务（另开一个窗口；或双击「启动简历测试.bat」）
-python -m uvicorn core.main:app --host 127.0.0.1 --port 8000
-
-:: 9) 手动触发一轮
-curl -X POST http://127.0.0.1:8000/api/v1/recruitment/run
-```
-
-验收：`http://127.0.0.1:8000/health` 返回 `status: ok`；`demo.py` 打印出「飞书已发 / 主管邮件已发 / 面试通知已发」即跑通。接口交互文档在 `http://127.0.0.1:8000/docs`。
-
-> 不想开终端：依次双击 `初始化数据库.bat` → `启动简历测试.bat` → `一键跑完整闭环.bat`。
-
-### 4.2 Linux / macOS
+### 4.4 建表（Alembic）
 
 ```bash
-# 1) 取代码
-git clone <repo-url> hr_ai_robot
-cd hr_ai_robot
+uv run alembic upgrade head
+uv run alembic current          # 应显示 0004_message_lookup (head)
+```
 
-# 2) 建虚拟环境（Python >= 3.11）
-python3 -m venv .venv
-source .venv/bin/activate
+如果这个库**以前被应用直接跑过**（启动时 `create_all` 建了表、但没有 `alembic_version`），
+直接 upgrade 会报 `relation "positions" already exists`。别删库，按版本打标再升：
 
-# 3) 装依赖
-python -m pip install -U pip
-python -m pip install -r requirements.txt
+```bash
+uv run alembic stamp 0001_initial
+uv run alembic upgrade head
+```
 
-# 4) 复制配置
+应用启动时也会自动 `upgrade head`（`AUTO_MIGRATE=true` 默认开，多副本用 PG 咨询锁互斥）。
+**它只做「把库升到 head」，不做体检**：换一台机器、换一个库（比如云端）时，真正会出事的是
+「版本号对上了，但 JSON 列还是 `json`、唯一索引没建」。那种情况用同步脚本，它会把三件事做完：
+
+```bash
+# 只看现状，不改任何东西（交接时先跑这个）
+uv run python scripts/sync_db.py --check --target postgresql://admin:***@10.191.44.66:15432/hr_ai_robot
+
+# 备份 → 迁移 → 逐条自证（jsonb / timestamptz / 10 个关键索引 / 幂等无重复）
+uv run python scripts/sync_db.py --target postgresql://admin:***@10.191.44.66:15432/hr_ai_robot
+
+# 云端还是空库，要把本机 6 张业务表一起搬过去（会先清空目标表，语义是「两边一致」）
+uv run python scripts/sync_db.py --target postgresql://... --copy-data --yes
+```
+
+脚本的行为约定：**库里有数据就必须先备份成功，否则拒绝改库**（备份走 `pg_dump`，
+本机没有时自动借用 `pgsql` 容器）；备份落在 `var/db_backup/`，同时生成两端可 diff 的索引快照。
+
+### 4.5 灌测试数据
+
+```bash
+uv run python scripts/seed.py --reset
+```
+
+> ⚠️ `--reset` 会 drop 并重建 6 张业务表。库里有真实简历时不要加这个参数，
+> 用 `uv run python scripts/seed.py` 只同步职位与主管。
+
+### 4.6 跑通闭环（不开服务）
+
+```bash
+FEISHU_MODE=mock MAIL_MODE=mock LLM_MODE=off uv run python scripts/demo.py
+```
+
+Windows cmd 下用 `set FEISHU_MODE=mock` 三行代替；PowerShell 用 `$env:FEISHU_MODE="mock"`。
+正常输出 `收到 6 份｜通过 5｜淘汰 1`，并打印主管收到的飞书文本与压缩包名。
+
+> ⚠️ `demo.py` **不会强制 mock**，它照 `.env` 里的模式发。`.env` 是 `live` 时会真的发邮件给真人。
+> 只想在现有数据上重跑就加 `--keep`。
+
+### 4.7 起服务
+
+```bash
+uv run python -m core.main
+# 或热重载开发：uv run uvicorn core.main:app --reload --port 8000
+```
+
+验证：
+
+```bash
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/api/v1/recruitment/positions
+```
+
+`/health` 的 `components` 会回显 feishu / mail / llm 模式、职位数、`auth` 是否开启、
+入站轮询间隔，一眼看出配没配对。接口文档：`http://127.0.0.1:8000/docs`。
+
+> ⚠️ **业务接口现在要鉴权**。`.env` 里配了 `API_TOKEN` 就必须带令牌，
+> 两种写法等价：`-H "X-API-Token: $API_TOKEN"` 或 `-H "Authorization: Bearer $API_TOKEN"`；
+> 不带令牌一律 401。健康检查 `/health` 和飞书回调 `/api/v1/feishu/webhook` 不需要令牌
+> （后者靠飞书签名 + token 校验）。`API_TOKEN` 留空时启动会打 `security.api_token_missing`
+> 警告，且只在 `ENVIRONMENT=dev` 下放行。
+>
+> ```bash
+> curl -H "X-API-Token: $API_TOKEN" "http://127.0.0.1:8000/api/v1/recruitment/stats?days=30&daily=true"
+> curl -H "X-API-Token: $API_TOKEN" "http://127.0.0.1:8000/api/v1/ops/funnel"
+> curl -H "X-API-Token: $API_TOKEN" "http://127.0.0.1:8000/api/v1/ops/metrics"
+> ```
+
+### 4.8 跑测试（206 个）
+
+测试库要先存在，且表要归跑测试的账号所有：
+
+```bash
+# 只需一次（hr 没有 CREATEDB，必须用超级用户建）
+docker exec -it <PG容器> psql -U postgres -c "CREATE DATABASE hr_ai_robot_test OWNER hr;"
+
+TEST_DATABASE_URL=postgresql+asyncpg://hr:hr@localhost:5432/hr_ai_robot_test \
+TEST_PG_AUTOSTART=0 uv run pytest -q
+```
+
+```text
+206 passed
+```
+
+> `TEST_PG_AUTOSTART=0` 禁止 pytest 自动 `docker compose up`（本机 5432 被占用时必须关）。
+> 测试会 TRUNCATE 测试库的表，`TEST_DATABASE_URL` 千万别指向有数据的库。
+
+### 4.9 报错对照表
+
+| 报错 | 原因 | 解决 |
+|---|---|---|
+| `No module named 'asyncpg.protocol.protocol'`<br>`cannot import name 'ArgsKwargs'` | venv 里解释器与二进制扩展版本不一致（在旧 venv 上重跑过 `venv`） | 删掉 `.venv` 重跑 `uv sync` |
+| `ModuleNotFoundError: fastapi` | 直接用了系统 python，没走 `uv run` | 命令前加 `uv run` |
+| `relation "positions" already exists` | 库是 `create_all` 建的，没有 `alembic_version` | `alembic stamp 0001_initial` 再 `upgrade head` |
+| `permission denied for table xxx` | 表属于别的账号（如 postgres） | 超级用户执行 `DROP SCHEMA public CASCADE; CREATE SCHEMA public AUTHORIZATION hr;` |
+| `permission denied to create database` | `hr` 没有 CREATEDB | 超级用户先建 `hr_ai_robot_test`，并设 `TEST_PG_AUTOSTART=0` |
+| `port is already allocated` | 5432 被其他容器占用 | 走情况 B，或改 compose 端口映射 |
+| 中文路径下 `uv sync` 报错 | 项目路径含空格/中文 | 把仓库放到纯英文路径 |
+
+### 4.10 Linux / macOS
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync
 cp .env.example .env
-```
-
-编辑 `.env` 确认数据库指向 PostgreSQL（默认即是，无需改动）：
-
-```bash
-grep '^DATABASE_URL' .env      # 应为 postgresql+asyncpg://hr:hr@localhost:5432/hr_robot
-```
-
-```bash
-# 5) 起数据库（需 Docker）
 docker compose up -d postgres
-
-# 6) 建表（Alembic 迁移） + 写入测试公司
-python -m alembic upgrade head
-python scripts/seed.py --reset
-
-# 7) 一条命令跑完整个闭环
-python scripts/demo.py --verbose
-
-# 8) 起服务
-python -m uvicorn core.main:app --host 127.0.0.1 --port 8000
+uv run alembic upgrade head
+uv run python scripts/seed.py --reset
+FEISHU_MODE=mock MAIL_MODE=mock LLM_MODE=off uv run python scripts/demo.py
+uv run python -m core.main
 ```
+
+### 4.11 数据与文件落盘位置
+
+| 内容 | 位置 | 说明 |
+|---|---|---|
+| 简历原件 | `var/resumes/` | 库里 `resume_path` 存**相对路径**（`var/resumes/xxx.pdf`），项目搬家不失效 |
+| 简历包 zip | `var/packages/` | 按「部门-职位-份数-批次」命名 |
+| 模拟收件箱 | `var/mock_inbox/` | mock 模式收到的邮件 |
+| 发件留档 | `var/outbox/mail/` | mock 模式发出的邮件 |
+| 数据库 | PostgreSQL | 6 张业务表；`candidates` 存 `resume_text`、`resume_path`、`structured`、`resume_sha256`、`parse_engine` |
+
+原件丢失（例如项目目录被移动过）时，可从库里的文本重建副本：
 
 ```bash
-# 9) 另开一个终端，手动触发一轮
-curl -X POST http://127.0.0.1:8000/api/v1/recruitment/run
+uv run python scripts/rebuild_resume_files.py --dry-run
+uv run python scripts/rebuild_resume_files.py
 ```
 
-验收同 Windows：`curl http://127.0.0.1:8000/health` 返回 `status: ok`。
-
-### 4.3 跑测试（同样需要 PostgreSQL）
+### 4.12 改表结构
 
 ```bash
-docker compose up -d postgres     # 测试库需要 PG 在线
-python -m pytest -q               # 190 个用例
+uv run alembic revision --autogenerate -m "说明"
+uv run alembic upgrade head
+uv run alembic check          # 校验「模型 vs 迁移」有无漂移
 ```
 
-> 测试库**不需要手工创建**：`tests/conftest.py` 会从 `DATABASE_URL` 派生 `hr_robot_test`，
-> 不存在就自动 `CREATE DATABASE`，每个用例前 `TRUNCATE` 清空。PG 没起时它会先尝试
-> `docker compose up -d postgres`，仍失败才打印一条可直接照抄的启动命令并退出。
-> 想用别的测试库：设 `TEST_DATABASE_URL`；想禁止自动拉起 docker：`TEST_PG_AUTOSTART=0`。
+### 4.13 常见疑问
 
-### 4.4 升级表结构（Alembic）
+**为什么仓库根目录没有 `main.py`？**
+入口是包内的 `core/main.py`（`python -m core.main`），Dockerfile 也用它。
+根目录再放一个 `main.py` 只会变成两份入口，迟早不一致。
+
+**为什么以前 `pip install -r requirements.txt` 要装 5 分钟？**
+`requirements.txt` 里有 `unstructured[pdf,docx]`，它会连带 torch / transformers / spacy，约 2GB。
+现在它被移到可选 extra，`uv sync` 只装 20 来个必要包（几十秒）；真遇到扫描件 PDF 再补：
 
 ```bash
-python -m alembic upgrade head          # 升级到最新版本
-python -m alembic current               # 看当前版本
-python -m alembic revision --autogenerate -m "说明"   # 改了 ORM 模型后生成迁移
-python -m alembic check                 # 校验「模型 vs 迁移」有没有漂移
+uv sync --extra ocr
 ```
 
-旧 SQLite 数据如仍需搬迁：`python scripts/migrate_sqlite_to_pg.py --dry-run` 先看统计，去掉 `--dry-run` 正式迁移。整包容器化：`docker compose up --build`。
+**依赖改了以后怎么办？**
+
+```bash
+uv add httpx           # 加依赖（自动改 pyproject.toml + uv.lock）
+uv remove httpx        # 删依赖
+uv lock --upgrade      # 只升版本，不动 pyproject
+```
+
+`uv.lock` 要提交到仓库，别人 clone 后 `uv sync` 得到完全相同的版本。

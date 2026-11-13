@@ -65,12 +65,12 @@ def _resolve_test_database_url() -> str:
 
     # 读 .env 里的 DATABASE_URL（环境变量 DATABASE_URL 优先级更高，由 Settings 处理）
     base_url = Settings().database_url
-    if base_url.startswith("sqlite"):
+    if not base_url.startswith("postgresql"):
         pytest.exit(
-            "测试已改为必须使用 PostgreSQL，但当前 DATABASE_URL 仍是 SQLite：\n"
+            "测试必须使用 PostgreSQL，当前 DATABASE_URL 不是 PG：\n"
             f"  {base_url}\n"
             "请把 .env 的 DATABASE_URL 改成 "
-            "postgresql+asyncpg://hr:hr@localhost:5432/hr_robot，"
+            "postgresql+asyncpg://hr:hr@localhost:5432/hr_ai_robot，"
             "或设置环境变量 TEST_DATABASE_URL 指向测试库。",
             returncode=1,
         )
@@ -197,6 +197,9 @@ def settings(tmp_path: Path, test_database_url: str) -> Settings:
         scheduler_enabled=False,
         inbound_poll_seconds=0,
         schedule_cron="0 9 * * *",
+        # 测试库由 init_models 按 ORM 直接建表；不要在这里跑 alembic
+        # （否则会拿迁移脚本去改一个刚刚 create_all 出来的库，版本表也对不上）
+        auto_migrate=False,
     )
 
 
