@@ -29,7 +29,7 @@ from core.logging import get_logger, log_extra
 from model.candidate import Candidate
 from model.email_thread import EmailThread, ThreadKind
 from model.position import Position
-from model.supervisor import Supervisor
+from model.supervisor import Supervisor, supervisor_from_position
 from repository.email_thread import EmailThreadRepository
 
 logger = get_logger(__name__)
@@ -46,6 +46,11 @@ PLATFORM_SENDER_MARKERS = (
     "noreply", "no-reply", "donotreply", "do-not-reply", "notice", "notification",
     "mailer-daemon", "bounce", "robot", "system", "cv@", "resume@", "job@", "hr-notice",
 )
+
+#: 由机器人发给主管、主管可以直接回复的线程类型。
+#: 命中这些线程的回信一律按「主管反馈」处理——候选人不可能拿到这些邮件的 Message-ID，
+#: 所以这个判断不会把候选人回信误认成主管。
+SUPERVISOR_THREAD_KINDS = (ThreadKind.RESUME_PACKAGE, ThreadKind.INTERVIEW_APPROVAL)
 
 
 def is_platform_sender(address: str) -> bool:
@@ -95,7 +100,7 @@ class EmailThreadService:
 
         thread, reason = await self._locate_thread(email)
         if thread is not None:
-            if thread.kind == ThreadKind.RESUME_PACKAGE:
+            if thread.kind in SUPERVISOR_THREAD_KINDS:
                 position = await self.session.get(Position, thread.position_id) if thread.position_id else None
                 supervisor = None
                 if position is not None:
@@ -189,12 +194,30 @@ class EmailThreadService:
         return None, "头部与 token 均未命中"
 
     async def _find_supervisor(self, address: str) -> Supervisor | None:
-        if not address:
+        value = (address or "").strip().lower()
+        if not value:
             return None
         result = await self.session.execute(
-            select(Supervisor).where(Supervisor.email.ilike(address.strip().lower()))
+            select(Supervisor).where(Supervisor.email.ilike(value))
         )
-        return result.scalars().first()
+        found = result.scalars().first()
+        if found is not None:
+            return found
+        # 兜底：主管「新写一封」邮件（没有 In-Reply-To、也没有 reply+token）时只能靠发件人认人，
+        # 而 supervisors 表因飞书号唯一索引只留了一位主管；职位配置里每人都有邮箱，以它为准。
+        rows = await self.session.execute(
+            select(Position)
+            .where(Position.supervisor_email.ilike(value), Position.active.is_(True))
+            .order_by(Position.id)
+        )
+        position = rows.scalars().first()
+        if position is None:
+            return None
+        logger.info(
+            "thread.supervisor_from_position",
+            extra=log_extra(email=value, position=position.code, name=position.supervisor_name),
+        )
+        return supervisor_from_position(position)
 
     async def attach_thread(
         self,
@@ -230,6 +253,7 @@ def extract_reply_token(addresses: list[str]) -> str:
 
 __all__ = [
     "EmailThreadService",
+    "SUPERVISOR_THREAD_KINDS",
     "ThreadMatch",
     "extract_reply_token",
     "has_resume_attachment",

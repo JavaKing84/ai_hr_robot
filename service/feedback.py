@@ -28,7 +28,7 @@ from model.candidate import Candidate, CandidateStatus
 from model.event import Actor
 from model.message import Channel, Direction, Message
 from model.position import Position
-from model.supervisor import Supervisor
+from model.supervisor import Supervisor, supervisor_from_position
 from repository.candidate import CandidateRepository
 from repository.event import EventRepository
 from repository.message import MessageRepository
@@ -70,6 +70,19 @@ _TIME_EXPR_RE = re.compile(
     r"(\d{1,2}\s*[:：]\s*\d{2}|\d{1,2}\s*[点时]|周[一二三四五六日天]|星期[一二三四五六日天]"
     r"|明天|后天|今天|上午|下午|晚上|下周|本周)"
 )
+
+# ---------------------------------------------------------------- 岗位录入二次确认
+# 「确认岗位 / 取消岗位」明确指岗位草稿；单独一个「确认」优先给面试通知（既有行为），
+# 只有当时没有待发面试通知时才归岗位。详见 _handle_job_intake_decision。
+_JOB_CONFIRM_RE = re.compile(
+    r"(确认岗位|岗位确认|确认新增|确认修改|确认录入|录入吧|就这么录|就按这个来录)",
+    re.IGNORECASE,
+)
+_JOB_CANCEL_RE = re.compile(
+    r"(取消岗位|岗位取消|不录了|别录了|不要这个岗位|这个岗位算了|岗位作废)",
+    re.IGNORECASE,
+)
+
 
 
 @dataclass
@@ -149,6 +162,16 @@ class FeedbackService:
         if approval is not None:
             await self.session.commit()
             return approval
+
+        # 场景 0b：HR 在飞书里回复「确认岗位 / 取消岗位」，让上面暂存的岗位草稿生效或作废。
+        # 紧跟在面试审批之后、模型路由之前：这是确定性关键词判断，不该消耗一次模型调用，
+        # 也不能让路由把「确认」解释成别的意图。
+        job_decision = await self._handle_job_intake_decision(
+            inbound, supervisor, message_row, pending_notices=len(pending_notices)
+        )
+        if job_decision is not None:
+            await self.session.commit()
+            return job_decision
 
         active = await self.candidates.list_active_for_positions(
             [p.id for p in positions], statuses=list(_SCHEDULABLE_STATUSES)
@@ -245,6 +268,12 @@ class FeedbackService:
         if _TIME_EXPR_RE.search(text):
             return None
 
+        # 「确认岗位 / 取消岗位」明确在说岗位草稿，不是答复面试通知。
+        # 不在这里让路的话，「确认岗位」会被 _CONFIRM_NOTICE_RE 里的「确认」
+        # 命中，于是把待发的面试通知全发了——HR 以为自己确认的是岗位。
+        if _JOB_CONFIRM_RE.search(text) or _JOB_CANCEL_RE.search(text):
+            return None
+
         cancel = _CANCEL_NOTICE_RE.search(text)
         confirm = _CONFIRM_NOTICE_RE.search(text)
         if not cancel and not confirm:
@@ -259,6 +288,9 @@ class FeedbackService:
         if not targets:
             targets = list(pending)
         target_ids = [row.id for row in targets]
+        # 回执文案要说清「他是在哪儿确认的」：从邮件回「确认」的人，看到
+        # 「已在飞书确认」会以为自己点错了地方，甚至再回一遍。
+        source = "邮件" if inbound.channel == Channel.EMAIL else "飞书"
 
         if cancel and not confirm:
             cancelled = await self.notification.cancel_pending_interview_notices(target_ids)
@@ -271,13 +303,21 @@ class FeedbackService:
                 reply,
                 kind="interview_approval_cancelled",
             )
+            await self._reply_to_source(
+                inbound, supervisor, reply, kind="interview_approval_cancelled"
+            )
             await self.events.record(
                 "interview.approval_cancelled",
                 actor=Actor.HR,
                 object_type="message",
                 object_id=message_row.id,
-                detail={"cancelled": cancelled, "message_ids": target_ids, "text": text[:200]},
-                note=f"HR 在飞书取消 {cancelled} 份面试通知（未投递）",
+                detail={
+                    "cancelled": cancelled,
+                    "message_ids": target_ids,
+                    "text": text[:200],
+                    "channel": inbound.channel,
+                },
+                note=f"HR 在{source}取消 {cancelled} 份面试通知（未投递）",
             )
             return FeedbackOutcome(
                 handled=True,
@@ -304,19 +344,26 @@ class FeedbackService:
                 f"已发送 {ok} 份面试通知，其中 {mocked} 份为演练模式（仅存草稿、未投递）。"
             )
         else:
-            reply = f"已按您的确认发送 {ok} 份面试通知。"
+            reply = f"已按您在{source}里的确认，发送 {ok} 份面试通知。"
         if failed:
             reply += f"另有 {failed} 份发送失败，我会稍后重试。"
         await self.notification.notify_supervisor(
             self._approval_open_id(supervisor), reply, kind="interview_approval_sent"
         )
+        await self._reply_to_source(inbound, supervisor, reply, kind="interview_approval_sent")
         await self.events.record(
             "interview.approval_confirmed",
             actor=Actor.HR,
             object_type="message",
             object_id=message_row.id,
-            detail={"sent": ok, "failed": failed, "message_ids": target_ids, "text": text[:200]},
-            note=f"HR 在飞书确认发送面试通知：成功 {ok} 份、失败 {failed} 份",
+            detail={
+                "sent": ok,
+                "failed": failed,
+                "message_ids": target_ids,
+                "text": text[:200],
+                "channel": inbound.channel,
+            },
+            note=f"HR 在{source}确认发送面试通知：成功 {ok} 份、失败 {failed} 份",
         )
         return FeedbackOutcome(
             handled=True,
@@ -328,6 +375,18 @@ class FeedbackService:
     def _approval_open_id(self, supervisor: Supervisor) -> str:
         """确认请示发给谁：配了 HR 本人 open_id 就发他，否则发触发安排的岗位主管。"""
         return (self.settings.hr_feishu_open_id or "").strip() or supervisor.feishu_open_id
+
+    async def _reply_to_source(
+        self, inbound: InboundMessage, supervisor: Supervisor, text: str, *, kind: str
+    ) -> None:
+        """回执回到「他说话的那个渠道」。
+
+        飞书那条由 ``notify_supervisor`` 照发（相当于给对方留一份摘要），
+        邮件来的指令再补一封邮件——否则主管在邮箱里操作完，邮箱里一片安静。
+        """
+        if inbound.channel != Channel.EMAIL or not supervisor.email:
+            return
+        await self.notification.notify_supervisor_by_email(supervisor.email, text, kind=kind)
 
     # ------------------------------------------------------------ 场景 B：安排
     async def _handle_schedule(
@@ -513,10 +572,17 @@ class FeedbackService:
         # 只有「确认闸门开着」时才需要再问一句；闸门关掉后这里恒为 0，
         # 主管说完就直接排，不再让他确认第二遍。
         if pending_total:
-            await self.notification.request_interview_approval(
-                self._approval_open_id(supervisor),
-                supervisor_title=supervisor.title or supervisor.name,
-            )
+            approval_title = supervisor.title or supervisor.name
+            # 指令从哪个渠道来，请示就回哪个渠道：主管在邮箱里发的指令，
+            # 飞书那条请示他看不到，面试通知会一直挂成待确认，看着像机器人没反应。
+            if inbound.channel == Channel.EMAIL and supervisor.email:
+                await self.notification.request_interview_approval_by_email(
+                    supervisor.email, supervisor_title=approval_title
+                )
+            else:
+                await self.notification.request_interview_approval(
+                    self._approval_open_id(supervisor), supervisor_title=approval_title
+                )
 
         # 排不了的人也要出现在同一条回执里，别让主管以为全都安排了。
         for name, reason in missing_pairs:
@@ -586,8 +652,14 @@ class FeedbackService:
         supervisor: Supervisor,
         image: bytes | None = None,
     ) -> FeedbackOutcome:
-        """主管发 JD（文字或截图）→ 解析成岗位配置并落盘，下一轮按新要求筛。"""
-        from service.job_intake import JobIntakeError, JobIntakeService, describe
+        """主管发 JD（文字或截图）→ 解析成岗位配置，**先暂存**，等主管确认再生效。
+
+        为什么不在这一步直接生效（2026-11-14 加）：模型偶尔会把「五年经验」抽成
+        一条奇怪的硬条件，或把「改要求」抽成一个新岗位；直接落盘的话下一轮收简历
+        就按错的规则筛，而 HR 以为自己只是「随口说了一句」。多一步确认，
+        错的成本从「筛错一整批」降到「回一句取消」。
+        """
+        from service.job_intake import JobIntakeError, JobIntakeService, describe_pending
 
         intake = JobIntakeService(settings=self.settings, llm=self.llm)
         try:
@@ -596,7 +668,6 @@ class FeedbackService:
                 if image is not None
                 else await intake.parse(inbound.text)
             )
-            path = intake.apply(position)
         except JobIntakeError as exc:
             text = str(exc)
             await self.notification.notify_supervisor(
@@ -604,18 +675,125 @@ class FeedbackService:
             )
             return FeedbackOutcome(handled=False, action="job_intake_failed", reply_text=text)
 
-        # 立即同步进数据库，HR 不用等到下一轮才在职位列表里看到
-        await self.positions.sync_from_config(self.settings.load_company_config())
+        # 同 code 说明这是在改一个已有的岗位，确认文案要说「修改」而不是「新增」，
+        # 否则主管会以为多了一个岗位，确认后发现旧的不见了。
+        exists = any(p.code == position.code for p in self.settings.load_company_config().positions)
+        path = intake.stage(position)
+        # 模型偶发失败时结果是规则拼的，确认文案要如实说明（intake.last_source）
+        text = describe_pending(position, exists=exists, source=intake.last_source)
+        await self.notification.notify_supervisor(
+            supervisor.feishu_open_id, text, kind="job_intake_confirm"
+        )
         await self.events.record(
-            "position.intaken",
+            "position.intake_staged",
             actor=Actor.SUPERVISOR,
             object_type="position",
             object_id=None,
-            detail={"code": position.code, "title": position.title, "file": str(path)},
-            note=f"主管发来招聘需求，已生成岗位配置：{position.title}",
+            detail={
+                "code": position.code,
+                "title": position.title,
+                "file": str(path),
+                "replaces_existing": exists,
+                "source": intake.last_source,
+            },
+            note=f"主管发来招聘需求，已暂存待确认：{position.title}",
         )
+        return FeedbackOutcome(
+            handled=True,
+            action="job_intake_staged",
+            detail={
+                "code": position.code,
+                "file": str(path),
+                "replaces_existing": exists,
+                "source": intake.last_source,
+            },
+            reply_text=text,
+        )
+
+    # --------------------------------------- 场景 B1b：岗位草稿的确认 / 作废
+    async def _handle_job_intake_decision(
+        self,
+        inbound: InboundMessage,
+        supervisor: Supervisor,
+        message_row: Message,
+        *,
+        pending_notices: int = 0,
+    ) -> FeedbackOutcome | None:
+        """HR 回复「确认岗位 / 取消岗位」时，让暂存的草稿生效或作废。
+
+        返回 ``None`` 表示这条消息不是岗位确认，交回原有流程。
+
+        关键词优先级（刻意这样排，避免和面试通知的「确认」打架）：
+        - 带「岗位」二字（确认岗位 / 取消岗位）→ 一律归岗位，优先级最高；
+        - 单独一个「确认」→ 只有**当前没有待发面试通知**时才归岗位，
+          否则保持既有行为（归面试通知），不动已跑通的审批路径。
+        """
+        from service.job_intake import JobIntakeService, describe
+
+        text = (inbound.text or "").strip()
+        if not text:
+            return None
+
+        intake = JobIntakeService(settings=self.settings, llm=self.llm)
+        if not intake.staged_codes():
+            return None  # 没有待确认的岗位，别抢别人的「确认」
+
+        explicit_confirm = bool(_JOB_CONFIRM_RE.search(text))
+        explicit_cancel = bool(_JOB_CANCEL_RE.search(text))
+        if explicit_confirm:
+            decision = "confirm"
+        elif explicit_cancel:
+            decision = "cancel"
+        elif _CANCEL_NOTICE_RE.search(text):
+            decision = "cancel"
+        elif _CONFIRM_NOTICE_RE.search(text) and not pending_notices:
+            decision = "confirm"
+        else:
+            return None
+
+        # 待确认可能不止一份：只取最近一次录入的那份（HR 说「确认」时脑子里就是它）
+        code = intake.latest_staged_code()
+        position = intake.load_staged(code)
+        if position is None:
+            text = "那份待确认的岗位草稿我找不到了（可能已经处理过）。把要求再发我一遍，我重新确认一次。"
+            await self.notification.notify_supervisor(
+                supervisor.feishu_open_id, text, kind="job_intake_missing"
+            )
+            return FeedbackOutcome(handled=False, action="job_intake_missing", reply_text=text)
+
+        if decision == "cancel":
+            intake.discard(code)
+            text = f"已作废「{position.title}」，现有在招岗位一个都没动。"
+            await self.notification.notify_supervisor(
+                supervisor.feishu_open_id, text, kind="job_intake_discarded"
+            )
+            await self.events.record(
+                "position.intake_discarded",
+                actor=Actor.HR,
+                object_type="message",
+                object_id=message_row.id,
+                detail={"code": code, "title": position.title, "text": text[:200]},
+                note=f"HR 作废了待确认的岗位草稿：{position.title}",
+            )
+            return FeedbackOutcome(
+                handled=True, action="job_intake_discarded", detail={"code": code}, reply_text=text
+            )
+
+        # 确认：写正式草稿 → 立刻同步进数据库（HR 不用等下一轮才在职位列表里看到）
+        path = intake.commit(position)
+        await self.positions.sync_from_config(self.settings.load_company_config())
         text = describe(position)
-        await self.notification.notify_supervisor(supervisor.feishu_open_id, text, kind="job_intake")
+        await self.notification.notify_supervisor(
+            supervisor.feishu_open_id, text, kind="job_intake"
+        )
+        await self.events.record(
+            "position.intaken",
+            actor=Actor.HR,
+            object_type="position",
+            object_id=None,
+            detail={"code": position.code, "title": position.title, "file": str(path)},
+            note=f"HR 确认录入岗位：{position.title}",
+        )
         return FeedbackOutcome(
             handled=True,
             action="job_intake",
@@ -1077,10 +1255,31 @@ class FeedbackService:
         return result.scalars().first()
 
     async def _supervisor_by_email(self, email: str) -> Supervisor | None:
+        address = (email or "").strip().lower()
+        if not address:
+            return None
         result = await self.session.execute(
-            select(Supervisor).where(Supervisor.email.ilike((email or "").strip().lower()))
+            select(Supervisor).where(Supervisor.email.ilike(address))
         )
-        return result.scalars().first()
+        found = result.scalars().first()
+        if found is not None:
+            return found
+        # 兜底：supervisors 表按飞书号存人，多个主管共用同一个飞书号时会被挤成一行，
+        # 表里只剩最后同步的那位。邮件认人因此必须回落到职位配置——否则张伟/李娜
+        # 从自己邮箱回复，走到这里就被判成「不是已登记的主管」，回信静默消失。
+        rows = await self.session.execute(
+            select(Position)
+            .where(Position.supervisor_email.ilike(address), Position.active.is_(True))
+            .order_by(Position.id)
+        )
+        position = rows.scalars().first()
+        if position is None:
+            return None
+        logger.info(
+            "feedback.supervisor_from_position",
+            extra=log_extra(email=address, position=position.code, name=position.supervisor_name),
+        )
+        return supervisor_from_position(position)
 
     async def _positions_of(self, supervisor: Supervisor) -> list[Position]:
         result = await self.session.execute(

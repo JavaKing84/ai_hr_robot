@@ -30,11 +30,15 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from sqlalchemy.engine import make_url  # noqa: E402
+
 from config.settings import Settings  # noqa: E402
 from core.db import (  # noqa: E402
+    assert_disposable_database,
     derive_test_database_url,
     ensure_database_exists,
     init_models,
+    prefer_local_test_target,
     truncate_all_tables,
 )
 from core.deps import build_container, build_services  # noqa: E402
@@ -123,13 +127,18 @@ async def main() -> int:
         shutil.rmtree(WORK, ignore_errors=True)
     WORK.mkdir(parents=True, exist_ok=True)
 
-    # e2e 用独立 PG 库（<库名>_e2e），与生产库、pytest 测试库三者互不干扰
+    # e2e 用独立 PG 库（<库名>_e2e），与生产库、pytest 测试库三者互不干扰。
+    # 同 conftest：库名必须 * _e2e 结尾（护栏），且本机可用时一律走本机，
+    # 免得每次验收都在共享服务器上清库。
     base_settings = Settings(_env_file=str(ROOT / ".env"))
     if not base_settings.database_url.startswith("postgresql"):
         print("DATABASE_URL 不是 PostgreSQL，无法跑四条链路验收。")
         print(f"当前值：{base_settings.database_url}")
         return 2
-    e2e_url = derive_test_database_url(base_settings.database_url, suffix="_e2e")
+    derived_e2e = derive_test_database_url(base_settings.database_url, suffix="_e2e")
+    assert_disposable_database(derived_e2e, purpose="四条链路验收")
+    e2e_url, reason = prefer_local_test_target(derived_e2e)
+    print(f"[e2e] 验收库：{reason} → {make_url(e2e_url).render_as_string(hide_password=True)}")
     await ensure_database_exists(e2e_url)
 
     settings = Settings(

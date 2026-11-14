@@ -5,12 +5,36 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.threading import normalize_message_id
 from model.message import Channel, Direction, Message
 from repository.base import BaseRepository
 
 
 class MessageRepository(BaseRepository[Message]):
     model = Message
+
+    async def find_sent_by_message_id(self, message_id: str) -> Message | None:
+        """按 Message-ID 找「我们自己发出去的邮件」。
+
+        用途：识别自投回流的邮件。演示环境里主管邮箱就是 HR 邮箱（``18786112948@163.com``），
+        简历包发出去会回到同一个收件箱，如果照常处理，它会被当成「主管说了句话」，
+        每次发包都触发一次自问自答，还会重复登记一条线程（2026-11-14 真机实测到）。
+
+        两种写法都试：发信按 ``<x@y>`` 生成并留痕，收信解析会把尖括号剥掉。
+        """
+        value = normalize_message_id(message_id)
+        if not value:
+            return None
+        result = await self.session.execute(
+            select(Message)
+            .where(
+                Message.external_id.in_((value, f"<{value}>")),
+                Message.direction == Direction.OUTBOUND,
+                Message.status.in_(("sent", "mocked")),
+            )
+            .limit(1)
+        )
+        return result.scalars().first()
 
     async def list_for_candidate(self, candidate_id: int) -> list[Message]:
         result = await self.session.execute(

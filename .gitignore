@@ -14,3 +14,7 @@ tests/testdata/
 audit_output/
 .workbuddy/
 .vscode/
+
+# 岗位「待确认」草稿：HR 每发一次 JD 就会生成一个，属于临时状态，不该进版本库。
+# 正式的 config/positions.d/*.yaml 是配置，要提交。
+config/positions.d/_pending/

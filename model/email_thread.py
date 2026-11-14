@@ -24,6 +24,7 @@ from model.base import JSONBType, TimestampMixin, UTCDateTime
 
 class ThreadKind:
     RESUME_PACKAGE = "resume_package"        # 简历包（主管可直接在原邮件上回复名单）
+    INTERVIEW_APPROVAL = "interview_approval"  # 「确认发送」请示（主管直接回「确认」即可）
     INTERVIEW_NOTICE = "interview_notice"    # 面试通知（候选人回复改期/放弃）
     INTERVIEW_UPDATE = "interview_update"    # 改期确认
     DECLINE_ACK = "decline_ack"              # 放弃确认

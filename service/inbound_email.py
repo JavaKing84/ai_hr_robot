@@ -2,6 +2,7 @@
 
 分流规则（保证「收简历」与「处理回复」不会互相吞掉对方的邮件）：
 0. 带简历附件 → 一律视为「新简历投递」，跳过按发件人认人的兜底（见下）
+0.5 机器人自己发出的邮件回流 → 直接忽略（主管邮箱与 HR 邮箱相同时会自己发给自己）
 1. 命中线程 / 发件人是候选人 → 候选人回信（改期、放弃、确认）
 2. 命中线程 / 发件人是主管 → 主管反馈（走 ``service/feedback.py``，与飞书同一条代码路径）
 3. 未命中且带简历附件（或正文像简历）→ 交给 ``service/ingestion.py`` 入库
@@ -34,6 +35,7 @@ from schema.config import MailboxConfig
 from schema.message import InboundMessage
 from service.email_threading import (
     RESUME_ATTACHMENT_SUFFIXES,
+    SUPERVISOR_THREAD_KINDS,
     EmailThreadService,
     ThreadMatch,
     has_resume_attachment,
@@ -94,6 +96,14 @@ class InboundEmailService:
                 logger.exception("inbound.failed", extra=log_extra(subject=email.subject))
                 response.failed += 1
                 response.errors.append(f"{email.subject or email.from_address}: {exc}")
+                # 必须回滚：数据库类异常（典型是两个轮询同时跑撞上 messages 的唯一索引）
+                # 会把会话标记成「需要回滚」，之后所有语句都报 PendingRollbackError——
+                # 于是单封失败被放大成整轮失败，结尾的 commit 再抛一次，接口直接 500。
+                # 2026-11-14 实测：11 封邮件全部入库成功，接口却回了 500，就是这个原因。
+                try:
+                    await self.session.rollback()
+                except Exception:  # noqa: BLE001 - 回滚都失败就只能放弃这一轮，别再抛
+                    logger.exception("inbound.rollback_failed", extra=log_extra(subject=email.subject))
                 continue
             if outcome.handled:
                 response.processed += 1
@@ -119,15 +129,39 @@ class InboundEmailService:
                 kind="duplicate", handled=False, detail={"reason": "重复邮件（Message-ID 已处理）"}
             )
 
+        # 自投回流：机器人自己发出的邮件又回到了收件箱。
+        # 演示环境里主管邮箱就是 HR 邮箱（18786112948@163.com），简历包发出去会绕回同一个 INBOX；
+        # 不挡的话它会被当成「主管说了句话」，每次发包都自问自答一次，还会重复登记一条线程。
+        if await self.messages.find_sent_by_message_id(email.message_id) is not None:
+            logger.info(
+                "inbound.self_echo_skipped",
+                extra=log_extra(message_id=email.message_id, subject=email.subject),
+            )
+            return InboundOutcome(
+                kind="self_echo",
+                handled=False,
+                detail={"reason": "这是机器人自己发出的邮件回流，不再当作主管/候选人的消息"},
+            )
+
         match = await self.threads.match(email)
         # 双保险：即使线程匹配命中了主管/候选人，带简历附件的邮件也优先入库。
         # 真正需要按「回信」处理的邮件几乎不会带简历附件，且会带 In-Reply-To。
         resume_attached = has_resume_attachment(email)
+        # 例外：主管用「转发」寄回，或在回复里又附上了一份简历，回信同样带简历附件。
+        # 「带附件=新投递」是防平台共用发件人吞掉新简历的（2026-11-12 的 bug），
+        # 而挂在简历包线程上的回信不可能是候选人发来的——那条线程只由机器人发出。
+        # 这里只放行这一种情况，其他带附件的邮件仍走原逻辑。
+        supervisor_reply_on_thread = (
+            match.role == "supervisor"
+            and match.thread is not None
+            and match.thread.kind in SUPERVISOR_THREAD_KINDS
+            and bool(email.in_reply_to or email.references)
+        )
 
         if match.role == "candidate" and match.candidate is not None and not resume_attached:
             return await self._handle_candidate_reply(email, match)
 
-        if match.role == "supervisor" and not resume_attached:
+        if match.role == "supervisor" and (not resume_attached or supervisor_reply_on_thread):
             inbound = InboundMessage(
                 channel="email",
                 sender_id=email.from_address,

@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends
 
 from client.mailbox import InboundEmail
 from core.deps import Services, get_services
+from core.locks import LOCK_INBOUND_POLL, advisory_lock
 from core.logging import get_logger, log_extra
 from core.security import require_api_token
 from core.timeparse import now_utc_naive
@@ -29,7 +30,20 @@ router = APIRouter(
 
 @router.post("/poll", response_model=EmailPollResponse, summary="手动触发一次收信")
 async def poll_mailbox(services: Services = Depends(get_services)) -> EmailPollResponse:
-    return await services.orchestrator.poll_inbound()
+    """手动收一次信。
+
+    与定时任务共用同一把 PG 咨询锁：两边同时跑会把同一封邮件写两遍，
+    撞上 ``messages`` 的幂等唯一索引（2026-11-14 实测：11 封邮件都入库了，
+    接口却因为并发写冲突回了 500）。拿不到锁就返回空结果，这不是错误——
+    说明「这一刻定时任务正在收」，等它收完即可。
+    """
+    async with advisory_lock(
+        services.container.engine, LOCK_INBOUND_POLL, name="inbound-poll-http"
+    ) as acquired:
+        if not acquired:
+            logger.info("email.poll_skipped", extra=log_extra(reason="定时轮询正在进行"))
+            return EmailPollResponse()
+        return await services.orchestrator.poll_inbound()
 
 
 @router.post("/test", response_model=EmailTestResponse, summary="发送一封通道自检邮件")

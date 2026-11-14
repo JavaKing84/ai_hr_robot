@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from model.base import utcnow_naive
 from model.email_thread import EmailThread, ThreadKind
 from repository.base import BaseRepository
+from core.threading import normalize_message_id
 
 
 class EmailThreadRepository(BaseRepository[EmailThread]):
@@ -30,12 +31,17 @@ class EmailThreadRepository(BaseRepository[EmailThread]):
         supervisor_id: int | None = None,
         meta: dict[str, Any] | None = None,
     ) -> EmailThread:
+        # Message-ID 统一去掉尖括号再存：发信时我们是按 ``<xxx@domain>`` 生成的，
+        # 而收信解析（``parse_email_bytes``）会把尖括号剥掉。两边格式不一致时，
+        # 主管/候选人的回信永远匹配不上 In-Reply-To，只能退化到发件人兜底——
+        # 2026-11-14 补测试时实测到这个问题，此前「原邮件回复」实际没被这条路径命中过。
+        root = normalize_message_id(root_message_id) or root_message_id
         thread = EmailThread(
             token=token,
             kind=kind,
-            root_message_id=root_message_id,
-            message_ids=[root_message_id],
-            message_id_index=root_message_id,
+            root_message_id=root,
+            message_ids=[root],
+            message_id_index=root,
             subject=subject,
             reply_address=reply_address,
             counterpart_email=counterpart_email.lower(),
@@ -57,10 +63,11 @@ class EmailThreadRepository(BaseRepository[EmailThread]):
         return result.scalars().first()
 
     async def find_by_root_message_id(self, message_id: str) -> EmailThread | None:
-        if not message_id:
+        value = normalize_message_id(message_id)
+        if not value:
             return None
         result = await self.session.execute(
-            select(EmailThread).where(EmailThread.root_message_id == message_id).limit(1)
+            select(EmailThread).where(EmailThread.root_message_id == value).limit(1)
         )
         return result.scalars().first()
 
@@ -69,8 +76,10 @@ class EmailThreadRepository(BaseRepository[EmailThread]):
 
         2026-11-14：改用 jsonb 包含查询（``message_ids @> '["<id>"]'``）配合 GIN 索引，
         不再用 ``LIKE '%<id>%'``——后者前导通配符用不上索引，每条回信都要全表扫一遍。
+        查询前统一归一化（去尖括号），与 ``create()`` 的存储格式保持一致。
         """
-        cleaned = [mid for mid in message_ids if mid]
+        cleaned = [normalize_message_id(mid) for mid in message_ids if mid]
+        cleaned = [mid for mid in cleaned if mid]
         if not cleaned:
             return None
         conditions = [EmailThread.root_message_id.in_(cleaned)]
@@ -98,8 +107,11 @@ class EmailThreadRepository(BaseRepository[EmailThread]):
 
     async def append_message_id(self, thread: EmailThread, message_id: str, *, at: datetime | None = None) -> None:
         """记录本次发出的新 Message-ID（下次回复的 In-Reply-To 会指向它）。"""
+        value = normalize_message_id(message_id) or message_id
         ids = list(thread.message_ids or [])
-        ids.append(message_id)
+        if value in ids:
+            return
+        ids.append(value)
         thread.message_ids = ids
         thread.message_id_index = " ".join(ids)[:1024]
         thread.message_count = (thread.message_count or 1) + 1

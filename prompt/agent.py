@@ -47,6 +47,9 @@ ROUTER_FEW_SHOT = """\
 输入：这岗位要求改成五年经验，本科以上
 输出：{"intent": "job_posting", "names": [], "time_text": "", "location": "", "question": "", "count": 0, "confidence": 0.85}
 
+输入：后端岗学历要求提到硕士，关键词加上 Go
+输出：{"intent": "job_posting", "names": [], "time_text": "", "location": "", "question": "", "count": 0, "confidence": 0.85}
+
 输入：今天天气不错
 输出：{"intent": "chat", "names": [], "time_text": "", "location": "", "question": "今天天气不错", "confidence": 0.8}
 """
@@ -103,7 +106,7 @@ def build_router_prompt(
 - query_stats：问数量统计（收了多少、通过多少、淘汰多少）
 - query_resume：针对简历内容提问（会不会某技术、有没有某经验）
 - screen_top：「筛选 N 份」「先给我挑 5 份看看」——从已收简历里挑前 N 份给 HR 过目
-- job_posting：主管在发/改招聘需求（JD、岗位要求、任职资格），不是在对候选人下指令
+- job_posting：发来的招聘要求（JD、岗位名 + 学历/年限/关键词），**包括「改成…」「要求调整成…」这类修订**；不是在给候选人下指令
 - chat：打招呼、问你能做什么、与招聘无关的话
 - unknown：确实读不懂
 

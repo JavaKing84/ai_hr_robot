@@ -6,15 +6,24 @@
 
 测试库的生命周期全自动，不需要人工建库或改任何配置：
 
-1. 从 ``.env`` 的 ``DATABASE_URL`` 派生 ``<库名>_test``（如 ``hr_robot_test``）；
+1. 从 ``.env`` 的 ``DATABASE_URL`` 派生 ``<库名>_test``（如 ``hr_ai_robot_test``）；
 2. 库不存在就自动 ``CREATE DATABASE``；
 3. 每个用例开始前 ``TRUNCATE ... RESTART IDENTITY CASCADE``，等价于一个全新的库；
 4. 若 PostgreSQL 没启动，会自动尝试 ``docker compose up -d postgres``，
    仍失败则打印一条可以直接照抄的启动命令后退出（不会给你一堆看不懂的堆栈）。
 
+**三道防线，保证永远碰不到生产库**：
+
+- ① 库名必须落在 ``*_test`` / ``*_e2e`` 上，否则直接拒绝运行；
+- ② 本机 PostgreSQL 可用时，一律换成本机同名库（``hr:hr@localhost:5432``），
+  绝不在共享服务器的 ``TRUNCATE`` 上打转；
+- ③ 本机不可用、只能落在远程时，会打印一段醒目提示（说明会清哪个库），
+  想强制本机可设 ``TEST_REQUIRE_LOCAL=1``。
+
 可用环境变量覆盖：
-- ``TEST_DATABASE_URL``：直接指定测试库（跳过派生）；
-- ``TEST_PG_AUTOSTART=0``：禁止自动拉起 docker（CI 里想自己控制时用）。
+- ``TEST_DATABASE_URL``：直接指定测试库（跳过派生，但库名后缀仍受①约束）；
+- ``TEST_PG_AUTOSTART=0``：禁止自动拉起 docker（CI 里想自己控制时用）；
+- ``TEST_REQUIRE_LOCAL=1``：测试库不在本机就直接退出，不静默降级到远程。
 """
 
 from __future__ import annotations
@@ -32,14 +41,17 @@ from typing import AsyncIterator
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.engine import make_url
 
 from client.mailbox import InboundEmail, parse_email_bytes
 from config.settings import BASE_DIR, Settings
 from core.db import (
+    assert_disposable_database,
     build_engine,
     derive_test_database_url,
     ensure_database_exists,
     init_models,
+    prefer_local_test_target,
     truncate_all_tables,
 )
 from core.deps import Container, build_container, build_services
@@ -57,10 +69,20 @@ TEMPLATES_DIR = BASE_DIR / "config" / "templates"
 # ------------------------------------------------------- PostgreSQL 测试库准备
 
 
+def _mask(url: str) -> str:
+    """把连接串里的密码换成 ``***``，用于打印。"""
+    return make_url(url).render_as_string(hide_password=True)
+
+
 def _resolve_test_database_url() -> str:
-    """确定测试库地址：显式 ``TEST_DATABASE_URL`` 优先，否则由运行库派生。"""
+    """确定测试库地址，三道防线保证绝不碰生产库。
+
+    优先级：显式 ``TEST_DATABASE_URL`` > 本机同名库（可用时）> 派生的远程库。
+    无论走哪条路，库名都必须以 ``_test`` / ``_e2e`` 结尾，否则直接拒绝运行。
+    """
     explicit = (os.getenv("TEST_DATABASE_URL") or "").strip()
     if explicit:
+        assert_disposable_database(explicit, purpose="测试")
         return explicit
 
     # 读 .env 里的 DATABASE_URL（环境变量 DATABASE_URL 优先级更高，由 Settings 处理）
@@ -74,7 +96,41 @@ def _resolve_test_database_url() -> str:
             "或设置环境变量 TEST_DATABASE_URL 指向测试库。",
             returncode=1,
         )
-    return derive_test_database_url(base_url)
+
+    # 第一道防线：库名后缀。生产库不可能是 *_test / *_e2e。
+    derived = derive_test_database_url(base_url)
+    assert_disposable_database(derived, purpose="测试")
+
+    # 第二道防线：本机能用就绝不用远程（测试会频繁 TRUNCATE 目标库）。
+    url, reason = prefer_local_test_target(derived)
+    if url != derived:
+        print(f"\n[conftest] 测试库：{reason} → {_mask(url)}", flush=True)
+        return url
+
+    # 第三道防线：确实要落在远程时，把风险打印出来，不静默。
+    if (os.getenv("TEST_REQUIRE_LOCAL") or "").strip().lower() in {"1", "true", "yes"}:
+        pytest.exit(
+            f"已设置 TEST_REQUIRE_LOCAL=1，但测试库会落在远程：{_mask(derived)}\n"
+            f"原因：{reason}\n"
+            "请先启动本机 PostgreSQL（Docker Desktop → docker compose up -d postgres），"
+            "或取消该环境变量。",
+            returncode=1,
+        )
+
+    print(
+        "\n"
+        + "=" * 78
+        + "\n[conftest] 测试库落在共享服务器上\n"
+        f"           目标：{_mask(derived)}\n"
+        f"           原因：{reason}\n"
+        "           影响：每个用例前都会 TRUNCATE 这个库（生产库 hr_ai_robot 不受影响）\n"
+        "           想跑在本机：启动 Docker Desktop 后会自动切换；\n"
+        "           想强制本机：设 TEST_REQUIRE_LOCAL=1\n"
+        + "=" * 78
+        + "\n",
+        flush=True,
+    )
+    return derived
 
 
 def _probe(url: str) -> None:

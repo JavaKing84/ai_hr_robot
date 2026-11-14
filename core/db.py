@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import socket
+
 from sqlalchemy import text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
@@ -46,6 +48,80 @@ async def init_models(engine: AsyncEngine) -> None:
 
 
 # --------------------------------------------------------------- 测试库生命周期
+
+#: 允许被「清空 / 重建」的一次性库后缀。生产库永远不该落在这两种后缀上。
+#: 这是最后一道护栏：无论配置怎么写错，只要库名不以此结尾就直接拒绝执行。
+DISPOSABLE_SUFFIXES = ("_test", "_e2e")
+
+#: 本机 PostgreSQL 的固定账号（docker-compose.yml 里的 postgres 服务）。
+DEFAULT_LOCAL_PG_DSN = "postgresql+asyncpg://hr:hr@localhost:5432"
+
+#: 视为「本机」的主机名。
+LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0", ""})
+
+
+def assert_disposable_database(database_url: str, *, purpose: str = "测试") -> str:
+    """护栏：确认目标库是一次性库（名字以 ``_test`` / ``_e2e`` 结尾）。
+
+    调用方是「会 ``TRUNCATE`` / ``DROP`` 的代码」——测试夹具、验收脚本。
+    它们一旦指错库就会清掉真实数据，所以这里不做「尽量兼容」，而是直接抛错。
+    返回库名，方便调用方打印。
+    """
+    name = make_url(database_url).database or ""
+    if not name:
+        raise RuntimeError(f"拒绝执行{purpose}：连接串里没有库名（{database_url}）")
+    if not name.endswith(DISPOSABLE_SUFFIXES):
+        raise RuntimeError(
+            f"拒绝在库 {name!r} 上执行{purpose}：库名必须以 "
+            f"{' 或 '.join(DISPOSABLE_SUFFIXES)} 结尾。\n"
+            "这道护栏用来防止测试 / 验收脚本清空生产库；"
+            "需要新的一次性库时，请用带 _test / _e2e 后缀的名字。"
+        )
+    return name
+
+
+def is_local_host(host: str | None) -> bool:
+    """判断主机名是否指向本机。"""
+    return (host or "").lower() in LOCAL_HOSTS
+
+
+def port_open(host: str, port: int, *, timeout: float = 2.0) -> bool:
+    """探测某个 TCP 端口是否可连（不建连接池、不留连接）。"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def prefer_local_test_target(
+    database_url: str,
+    *,
+    local_dsn: str = DEFAULT_LOCAL_PG_DSN,
+    local_port: int = 5432,
+) -> tuple[str, str]:
+    """测试目标库优先落在本机：本机 PG 可用时，把远程 URL 换成同机的同名库。
+
+    为什么默认回本机：测试会对目标库执行 ``TRUNCATE``。跑在共享服务器上等于
+    每隔几秒清一次别人的库，而且每次用例都要走内网往返。本机能用就绝不用远程。
+
+    本机不可用（没装 / 没启动 Docker）时不报错，保留原远程地址并返回原因，
+    由调用方打印醒目提示——断网环境下仍然能跑测试，只是会写共享服务器。
+
+    返回 ``(最终url, 原因)``，原因用于日志与告警。
+    """
+    url = make_url(database_url)
+    if is_local_host(url.host):
+        return database_url, "目标已是本机"
+
+    if not port_open("127.0.0.1", local_port):
+        return database_url, f"本机 127.0.0.1:{local_port} 未监听，保留远程"
+
+    local_url = make_url(local_dsn).set(database=url.database)
+    return (
+        local_url.render_as_string(hide_password=False),
+        f"本机 127.0.0.1:{local_port} 可用，已切换为同机库",
+    )
 
 
 def derive_test_database_url(database_url: str, *, suffix: str = "_test") -> str:
@@ -129,10 +205,15 @@ async def truncate_all_tables(
 
 __all__ = [
     "Base",
+    "DISPOSABLE_SUFFIXES",
+    "assert_disposable_database",
     "build_engine",
     "build_session_factory",
     "derive_test_database_url",
     "ensure_database_exists",
     "init_models",
+    "is_local_host",
+    "port_open",
+    "prefer_local_test_target",
     "truncate_all_tables",
 ]

@@ -275,11 +275,24 @@ class Settings(BaseSettings):
 
 
 def _merge_draft_positions(config: CompanyConfig, draft_dir: Path) -> None:
-    """把 positions.d 下的岗位文件并入配置（同 code 以主配置为准，不覆盖）。"""
+    """把 positions.d 下的岗位文件并入配置；**同 code 的草稿覆盖主配置**。
+
+    为什么草稿优先：``positions.d`` 里的文件是 HR 后来在飞书里说的要求，
+    比手写的 ``positions.yaml`` 新，理应盖掉旧的那份。
+
+    2026-11-14 之前这里写的是「同 code 以主配置为准，直接 continue」，后果是：
+    HR 说「后端岗改成五年经验」→ 模型抽出 ``backend_senior``（撞上主配置的 code）
+    → 草稿被丢掉 → 但 ``JobIntakeService.apply`` 已经写盘、``position.intaken``
+    事件也记了、回复还说「已录入」。**配置一个字没变，人却被告诉改好了**，
+    这是最难查的一种失败。现在改成覆盖。
+
+    覆盖时要先从**所有**部门摘掉同 code 的旧条目再挂到新部门：
+    否则 HR 把一个岗位从技术部调到产品部，会出现两个部门各有一份同 code 的岗位。
+    """
     if not draft_dir.is_dir():
         return
-    existing = {p.code for p in config.positions}
     by_name = {d.name: d for d in config.departments}
+    default_department = config.departments[0] if config.departments else None
     for path in sorted(draft_dir.glob("*.yaml")):
         try:
             payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -287,14 +300,19 @@ def _merge_draft_positions(config: CompanyConfig, draft_dir: Path) -> None:
         except Exception:  # noqa: BLE001 - 单个文件坏掉不影响主配置加载
             logger.warning("config.draft_position_invalid", extra={"path": str(path)})
             continue
-        if position.code in existing:
-            continue
-        department = by_name.get(position.department) or (config.departments[0] if config.departments else None)
+
+        department = by_name.get(position.department or "") or default_department
         if department is None:
             continue
         position.department = department.name
+
+        for other in config.departments:
+            kept = [p for p in other.positions if p.code != position.code]
+            if len(kept) != len(other.positions):
+                # 重新赋值而不是原地 remove：pydantic 模型列表改了才稳妥，
+                # 也避免遍历时为「当前部门」和「旧部门」是同一个对象而漏摘。
+                other.positions = kept
         department.positions.append(position)
-        existing.add(position.code)
 
 
 @lru_cache(maxsize=1)

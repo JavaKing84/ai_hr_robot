@@ -71,3 +71,27 @@ def test_dependencies_have_no_frontend_packages() -> None:
     text = (BASE_DIR / "pyproject.toml").read_text(encoding="utf-8").lower()
     for package in FRONTEND_PACKAGES:
         assert package not in text, f"不应引入前端依赖: {package}"
+
+
+
+async def test_manual_poll_skips_when_scheduler_is_polling(client, container, monkeypatch) -> None:
+    """手动收信与定时轮询必须互斥，不能两边同时把同一封邮件写两遍。
+
+    2026-11-14 实测到的后果：并发写撞上 messages 的幂等唯一索引，
+    11 封邮件其实都入库了，接口却回 500。现在拿不到锁直接返回空结果（0/0/0），
+    连收信逻辑都不进——既不会重复写，也不会报错。
+    """
+    from core.locks import LOCK_INBOUND_POLL, advisory_lock
+    from service.orchestrator import Orchestrator
+
+    async def fake_poll(self):
+        raise AssertionError("拿不到锁时不应该真的去收信")
+
+    monkeypatch.setattr(Orchestrator, "poll_inbound", fake_poll)
+
+    async with advisory_lock(container.engine, LOCK_INBOUND_POLL, name="test-holder") as acquired:
+        assert acquired is True, "测试前置条件：应能拿到锁"
+        response = await client.post("/api/v1/email/poll")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"processed": 0, "ignored": 0, "failed": 0, "details": [], "errors": []}

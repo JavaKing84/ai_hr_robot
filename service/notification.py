@@ -311,6 +311,9 @@ class NotificationService:
             f"通过筛选的候选人：{'、'.join(c.name for c in candidates)}\n\n"
             "请直接回复本邮件告知面试名单与时间，例如：\n"
             "「请通知张三、李四，下周三下午 14:00 来公司面试」\n\n"
+            "（直接点「回复」，在正文里写名单和时间即可，不需要另外添加附件；\n"
+            "  附件里的简历包供您查阅，无需回传。）\n\n"
+            "本邮件含候选人个人信息，请勿转发给无关人员。\n\n"
             f"{self.company.name} HR 机器人\n"
         )
 
@@ -611,22 +614,14 @@ class NotificationService:
         await self.session.commit()
         return results
 
-    async def request_interview_approval(
-        self,
-        open_id: str,
-        *,
-        supervisor_title: str = "HR",
-    ) -> NoticeResult:
-        """在飞书向 HR 本人发一条「是否确认发送」的请示（不投递任何邮件）。
+    async def _approval_text(
+        self, pending: Sequence[Message], supervisor_title: str
+    ) -> tuple[str, list[dict[str, object]]]:
+        """拼「是否确认发送」的请示正文。
 
-        只在存在 ``pending_approval`` 草稿时才有意义；HR 回复「确认 / 确认 1,3 / 取消」
-        由 ``FeedbackService._handle_interview_approval()`` 接住并调用
-        ``confirm_pending_interview_notices()`` / ``cancel_pending_interview_notices()``。
+        飞书请示与邮件请示共用这一份文字：两处各写一份的话，改了一边忘了另一边，
+        主管在邮箱和飞书看到的条目编号会对不上，回复「确认 2」就发错人。
         """
-        pending = await self.pending_interview_notices()
-        if not pending:
-            return NoticeResult(ok=False, detail="当前没有待确认的面试通知")
-
         items: list[dict[str, object]] = []
         first_time: datetime | None = None
         first_location = ""
@@ -662,6 +657,25 @@ class NotificationService:
             location=first_location or self.mailbox_config.interview_location or "地点待定",
             company_name=self.company.name,
         )
+        return text, items
+
+    async def request_interview_approval(
+        self,
+        open_id: str,
+        *,
+        supervisor_title: str = "HR",
+    ) -> NoticeResult:
+        """在飞书向 HR 本人发一条「是否确认发送」的请示（不投递任何邮件）。
+
+        只在存在 ``pending_approval`` 草稿时才有意义；HR 回复「确认 / 确认 1,3 / 取消」
+        由 ``FeedbackService._handle_interview_approval()`` 接住并调用
+        ``confirm_pending_interview_notices()`` / ``cancel_pending_interview_notices()``。
+        """
+        pending = await self.pending_interview_notices()
+        if not pending:
+            return NoticeResult(ok=False, detail="当前没有待确认的面试通知")
+
+        text, items = await self._approval_text(pending, supervisor_title)
         result = await self.feishu.push_text(open_id, text)
         await self._record_feishu_out(
             recipient=self._feishu_recipient(open_id),
@@ -694,6 +708,125 @@ class NotificationService:
             extra=log_extra(open_id=open_id, pending=len(items), ok=result.ok),
         )
         return NoticeResult(ok=result.ok, message_id=result.message_id, detail=result.error)
+
+    async def request_interview_approval_by_email(
+        self,
+        to_address: str,
+        *,
+        supervisor_title: str = "HR",
+    ) -> NoticeResult:
+        """用邮件发「是否确认发送」的请示（主管在邮箱里回一句「确认」即可）。
+
+        为什么需要它：主管是从邮箱发来的指令，再跑去飞书问他就问错了地方——他人在邮箱，
+        看不到那条请示，面试通知会一直挂在 ``pending_approval``，看着像机器人没反应。
+        规则是「指令从哪个渠道来，请示就回哪个渠道」。
+
+        线程登记成 ``INTERVIEW_APPROVAL``：主管回的「确认」是一封新邮件，
+        只有挂在当前线程上，``EmailThreadService.match()`` 才认得出他是主管而非候选人。
+        """
+        if not to_address:
+            return NoticeResult(ok=False, detail="主管未配置邮箱，无法发确认请示")
+
+        pending = await self.pending_interview_notices()
+        if not pending:
+            return NoticeResult(ok=False, detail="当前没有待确认的面试通知")
+
+        text, items = await self._approval_text(pending, supervisor_title)
+        subject = f"【待确认】{len(items)} 份面试通知，回复「确认」发送"
+        token = uuid.uuid4().hex[:16]
+        reply_to = self.mailbox.reply_address(token)
+        message_id = self.mailbox.new_message_id()
+        position_id = pending[0].position_id
+
+        result = await self.mailbox.send(
+            to=to_address,
+            subject=subject,
+            body_text=text,
+            body_html=markdown_to_html(text),
+            message_id=message_id,
+            reply_to=reply_to,
+        )
+        thread = await self.threads.create(
+            token=token,
+            root_message_id=message_id,
+            kind=ThreadKind.INTERVIEW_APPROVAL,
+            subject=subject,
+            reply_address=reply_to,
+            counterpart_email=to_address,
+            position_id=position_id,
+        )
+        await self._record_email_out(
+            recipient=to_address,
+            subject=subject,
+            body=text,
+            message_id=message_id,
+            ok=result.ok,
+            error=result.error,
+            position_id=position_id,
+            thread_key=thread.token,
+        )
+        await self.events.record(
+            "interview.approval_requested",
+            actor=Actor.ROBOT,
+            object_type="message",
+            object_id=None,
+            detail={
+                "email": to_address,
+                "channel": "email",
+                "pending_count": len(items),
+                "pending_ids": [row.id for row in pending],
+                "mail_ok": result.ok,
+                "mail_error": result.error,
+            },
+            note=f"已通过邮件向 HR 请示：{len(items)} 份面试通知待确认，暂未投递",
+        )
+        await self.session.commit()
+        logger.info(
+            "interview.approval.requested_email",
+            extra=log_extra(to=to_address, pending=len(items), ok=result.ok),
+        )
+        return NoticeResult(ok=result.ok, message_id=message_id, detail=result.error)
+
+    async def notify_supervisor_by_email(
+        self,
+        to_address: str,
+        text: str,
+        *,
+        subject: str = "【面试安排】处理结果",
+        kind: str = "generic",
+        position_id: int | None = None,
+    ) -> NoticeResult:
+        """把处理结果回一封邮件给主管。
+
+        主管用邮件说话时，飞书那条回执他一辈子看不到——处理结果必须回到他说话的地方，
+        否则「我回了一封邮件，然后就没了」。飞书那条摘要仍然照发，两边都能查。
+        """
+        if not to_address:
+            return NoticeResult(ok=False, detail="主管未配置邮箱")
+        message_id = self.mailbox.new_message_id()
+        result = await self.mailbox.send(
+            to=to_address,
+            subject=subject,
+            body_text=text,
+            body_html=markdown_to_html(text),
+            message_id=message_id,
+        )
+        await self._record_email_out(
+            recipient=to_address,
+            subject=subject,
+            body=text,
+            message_id=message_id,
+            ok=result.ok,
+            error=result.error,
+            position_id=position_id,
+            status=None if result.ok else "failed",
+        )
+        await self.session.commit()
+        logger.info(
+            "mail.supervisor_result",
+            extra=log_extra(to=to_address, kind=kind, ok=result.ok),
+        )
+        return NoticeResult(ok=result.ok, message_id=message_id, detail=result.error)
 
     async def cancel_pending_interview_notices(
         self, message_ids: Sequence[int] | None = None

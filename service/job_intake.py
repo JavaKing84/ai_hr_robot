@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,20 @@ logger = get_logger(__name__)
 
 DRAFT_DIR = BASE_DIR / "config" / "positions.d"
 
+#: 待确认草稿的子目录名。放在 ``positions.d`` 下面有个好处：
+#: ``Settings._merge_draft_positions`` 用的是 ``glob("*.yaml")``（不递归），
+#: 这个子目录天然不会被当成正式岗位读进去。
+#:
+#: 这里刻意**不**把路径算成模块级常量 ``PENDING_DIR = DRAFT_DIR / "_pending"``：
+#: 测试会 monkeypatch ``DRAFT_DIR`` 指到临时目录，常量在 import 时就固化了，
+#: 结果待确认文件会写进真实仓库。每次调用时再算才能跟着 monkeypatch 走。
+PENDING_DIRNAME = "_pending"
+
+
+def pending_dir() -> Path:
+    """当前的待确认目录（跟随 ``DRAFT_DIR``，便于测试替换）。"""
+    return DRAFT_DIR / PENDING_DIRNAME
+
 
 class JobIntakeError(ValueError):
     """JD 解析失败或字段非法：消息直接回给主管，让他补一句。"""
@@ -35,6 +50,11 @@ class JobIntakeService:
     def __init__(self, *, settings: Settings, llm: LLMClient | None) -> None:
         self.settings = settings
         self.llm = llm
+        #: 上一次解析是模型抽的还是规则兜底的（``llm`` / ``rule``）。
+        #: 模型偶发超时会让结果退回 ``_rule_parse``，那份结果的标题常常是整句话、
+        #: 部门是默认值，看起来却「像模像样」。这个标记让确认文案能如实说明，
+        #: 否则 HR 会以为自己核对的是模型抽取的结果。
+        self.last_source = "rule"
 
     async def parse(self, text: str) -> PositionConfig:
         """JD 文本 → 已校验的岗位配置。"""
@@ -47,6 +67,7 @@ class JobIntakeService:
         default_department = departments[0] if departments else "技术部"
 
         data: dict[str, Any] | None = None
+        self.last_source = "rule"
         if self.llm is not None:
             try:
                 data = await self.llm.complete_json(
@@ -57,6 +78,7 @@ class JobIntakeService:
                     temperature=0.1,
                     max_tokens=1200,
                 )
+                self.last_source = "llm"
             except Exception as exc:  # noqa: BLE001 - 模型失败退回规则解析
                 logger.warning("job_intake.llm_failed", extra=log_extra(error=f"{type(exc).__name__}: {exc}"))
         # 模型偶尔只吐一条规则或包了一层 {"position": {...}}，这里都拆平；
@@ -66,6 +88,8 @@ class JobIntakeService:
             fallback = _rule_parse(text, default_department=default_department)
             fallback.update({k: v for k, v in data.items() if v})
             data = fallback
+            # 连标题都没抽出来，说明模型这次没帮上忙，产物其实是规则拼的
+            self.last_source = "rule"
         return _to_position(data, default_department=default_department)
 
     async def parse_image(self, image_bytes: bytes, *, mime: str = "image/png") -> PositionConfig:
@@ -90,17 +114,101 @@ class JobIntakeService:
         return await self.parse(text)
 
     def apply(self, position: PositionConfig) -> Path:
-        """把岗位配置写成 ``config/positions.d/<code>.yaml``（同 code 覆盖）。"""
+        """把岗位配置写成 ``config/positions.d/<code>.yaml``（同 code 覆盖）。
+
+        这是「直接生效」的老入口，脚本与测试还在用。走飞书对话时要先
+        :meth:`stage` 再 :meth:`commit`——中间留给主管确认。
+        """
         DRAFT_DIR.mkdir(parents=True, exist_ok=True)
         path = DRAFT_DIR / f"{position.code}.yaml"
-        payload = position.model_dump(mode="json", exclude_none=True)
-        path.write_text(
-            "# 由机器人生成（主管在飞书/邮件里发的招聘需求）。手改也可以，格式同 positions.yaml。\n"
-            + yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
-            encoding="utf-8",
+        _dump(
+            path,
+            position,
+            header="# 由机器人生成（主管在飞书/邮件里发的招聘需求）。手改也可以，格式同 positions.yaml。\n",
         )
         logger.info("job_intake.applied", extra=log_extra(code=position.code, path=str(path)))
         return path
+
+    # ------------------------------------------------------ 二次确认：暂存 / 生效 / 作废
+    def stage(self, position: PositionConfig) -> Path:
+        """写进「待确认」目录，**不**影响任何在招岗位。
+
+        确认前不碰 ``positions.d``：模型偶尔会把「五年经验」抽成一条奇怪的硬条件，
+        直接生效的话，下一轮收简历就按错的规则筛，而 HR 以为自己只是「说了一句」。
+        """
+        directory = pending_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{position.code}.yaml"
+        _dump(
+            path,
+            position,
+            header="# 待主管确认的岗位草稿（尚未生效）。主管回复「确认」后由 commit() 移入 positions.d/。\n",
+        )
+        logger.info("job_intake.staged", extra=log_extra(code=position.code, path=str(path)))
+        return path
+
+    def commit(self, position: PositionConfig) -> Path:
+        """主管确认后生效：写正式草稿，并删掉暂存文件。"""
+        path = self.apply(position)
+        self.discard(position.code)
+        logger.info("job_intake.committed", extra=log_extra(code=position.code, path=str(path)))
+        return path
+
+    def discard(self, code: str) -> bool:
+        """作废一份暂存草稿；返回是否真的删掉了文件。"""
+        path = pending_dir() / f"{code}.yaml"
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return False
+        logger.info("job_intake.discarded", extra=log_extra(code=code))
+        return True
+
+    def load_staged(self, code: str) -> PositionConfig | None:
+        """把暂存的配置读回来（确认时用**主管当时看到的那份**，不重新调模型）。"""
+        path = pending_dir() / f"{code}.yaml"
+        if not path.exists():
+            return None
+        try:
+            payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            return PositionConfig.model_validate(payload)
+        except Exception as exc:  # noqa: BLE001 - 文件被手改坏了，当作没有暂存
+            logger.warning(
+                "job_intake.staged_invalid",
+                extra=log_extra(code=code, error=f"{type(exc).__name__}: {exc}"),
+            )
+            return None
+
+    def staged_codes(self) -> list[str]:
+        """当前待确认的岗位 code 列表（按文件名排序，结果稳定）。"""
+        directory = pending_dir()
+        if not directory.is_dir():
+            return []
+        return sorted({p.stem for p in directory.glob("*.yaml")})
+
+    def latest_staged_code(self) -> str:
+        """最近一次录入的暂存 code；没有则返回空串。
+
+        主管只说「确认」时，指的是刚刚发给他的那份。多份待确认并存
+        （连发两份 JD 没回确认）就按修改时间取最新，避免让他记住 code。
+        """
+        directory = pending_dir()
+        if not directory.is_dir():
+            return ""
+        files = [p for p in directory.glob("*.yaml") if p.is_file()]
+        if not files:
+            return ""
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return files[0].stem
+
+
+def _dump(path: Path, position: PositionConfig, *, header: str) -> None:
+    payload = position.model_dump(mode="json", exclude_none=True)
+    path.write_text(
+        header + yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
 
 
 def describe(position: PositionConfig) -> str:
@@ -112,6 +220,39 @@ def describe(position: PositionConfig) -> str:
         f"及格线 {position.screening.threshold:.0f} 分。下一轮收简历就按这个筛。\n"
         "要改直接再发我一遍新的要求。"
     )
+
+
+def describe_pending(position: PositionConfig, *, exists: bool = False, source: str = "llm") -> str:
+    """二次确认文案：把模型抽出来的东西摊开给主管核对，再问「确认」。
+
+    ``exists=True`` 表示这是覆盖一个已有 code 的岗位（改要求），措辞要区分，
+    否则主管会以为是新增，改完发现旧岗位不见了。
+
+    ``source="rule"`` 表示模型这次没帮上忙、内容是简单规则拼的：必须写在脸上。
+    那种结果的岗位名常常是「整句话」，部门是默认值——看起来却很像真的。
+    """
+    action = "修改岗位" if exists else "新增岗位"
+    hard = "、".join(c.label or str(c.field) for c in position.screening.hard_conditions) or "无"
+    keywords = "、".join(position.keywords[:8])
+    if not keywords:
+        keywords = "、".join(
+            "、".join(str(v) for v in c.value) if isinstance(c.value, list) else str(c.value)
+            for c in position.screening.weighted
+        ) or "无"
+    warn = (
+        "⚠️ 模型这次没响应，下面是我用简单规则抓的，字段大概率不准。"
+        "建议先回「取消」，再把岗位名称和要求分两行发我一遍。\n\n"
+        if source != "llm"
+        else ""
+    )
+    return (
+        f"{warn}确认{action}？回复「确认」生效，回复「取消」作废。\n\n"
+        f"岗位：{position.title}（{position.department}，招 {position.headcount} 人）\n"
+        f"硬性条件：{hard}\n"
+        f"加权关键词：{keywords}\n"
+        f"及格线 {position.screening.threshold:.0f} 分"
+    )
+
 
 
 # ---------------------------------------------------------------- 内部：校验与兜底
@@ -182,7 +323,18 @@ def _clean_weight(raw: Any) -> dict[str, Any] | None:
 
 def _slug(text: str) -> str:
     ascii_part = re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_")
-    return ascii_part or f"position_{abs(hash(str(text))) % 10000}"
+    # 只认「至少两个连续字母」才算可读 slug。
+    # 反例：JD 前 20 字里只有「3 年以上经验」的那个 3 时，ascii_part 会是 "3"，
+    # 于是「3 年经验的产品经理」和「3 年经验的后端」都得到 code="3"——
+    # 后录的那份把先录的覆盖掉，HR 却看到「已录入」。数字当不了岗位标识。
+    if ascii_part and re.search(r"[a-z]{2,}", ascii_part):
+        return ascii_part[:40].strip("_")
+    # 中文标题没有 ascii 可用，用内容哈希兜底。
+    # 不能用内置 hash()：它受 PYTHONHASHSEED 影响，同一段 JD 换个进程就算出另一个值，
+    # 于是「同 code 覆盖」失效——主管把同一份 JD 发两次，会留下两个岗位文件，
+    # 下一轮任务里就成了两个重复岗位。md5 与进程无关，稳定。
+    digest = hashlib.md5(str(text).encode("utf-8")).hexdigest()[:8]
+    return f"position_{digest}"
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -210,7 +362,9 @@ def _rule_parse(text: str, *, default_department: str) -> dict[str, Any]:
         )
     words = [w for w in re.split(r"[，。；、\s/|]+", text) if 2 <= len(w) <= 12][:8]
     return {
-        "code": _slug(text[:20]),
+        # 用**整段** JD 算 code，不用前 20 字：两份要求不同但开头一样的 JD
+        # （「3 年以上经验的产品经理」/「3 年以上经验的后端」）否则会撞成同一个岗位。
+        "code": _slug(text),
         "title": (text.strip().splitlines() or ["未命名岗位"])[0][:30],
         "department": default_department,
         "headcount": 1,
@@ -224,4 +378,12 @@ def _rule_parse(text: str, *, default_department: str) -> dict[str, Any]:
     }
 
 
-__all__ = ["DRAFT_DIR", "JobIntakeError", "JobIntakeService", "describe"]
+__all__ = [
+    "DRAFT_DIR",
+    "PENDING_DIRNAME",
+    "JobIntakeError",
+    "JobIntakeService",
+    "describe",
+    "describe_pending",
+    "pending_dir",
+]

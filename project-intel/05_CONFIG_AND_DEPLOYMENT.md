@@ -99,7 +99,7 @@
 | 1 | `FROM python:3.11-slim` | 与本地 venv（3.13/3.14 混乱，见 §6 R-4）不同 |
 | 5-8 | 设 `TZ=Asia/Shanghai`、不写 pyc、不缓冲输出 | |
 | 12-14 | `apt-get install curl libmagic1 poppler-utils` | `unstructured` 解析 PDF 需要 |
-| 16-17 | 装 `requirements.txt` | |
+| 16-17 | 装 `requirements.txt` | ⚠️ **快照后已变更**：`requirements.txt` 已删除，现为 `COPY pyproject.toml uv.lock` + `uv sync --frozen --no-dev`；见 `project-intel/README.md` |
 | 21 | `mkdir -p var/resumes var/packages var/outbox/mail var/mock_inbox` | 运行时目录 |
 | 23 | `EXPOSE 8000` | |
 | 25-26 | `HEALTHCHECK curl /health` | |
